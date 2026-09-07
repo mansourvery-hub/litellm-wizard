@@ -64,6 +64,8 @@ mkdir -p ~/.config/litellm ~/.config/systemd/user
 # 3) Put the repo files into place (from section 0's clone):
 cp ~/litellm-wizard/wizard.py ~/.config/litellm/wizard.py
 cp ~/litellm-wizard/litellm.service ~/.config/systemd/user/litellm.service
+# Make sure the wizard is runnable directly (cp doesn't always keep the exec bit):
+chmod +x ~/.config/litellm/wizard.py
 
 # 4) Isolated Python box + install LiteLLM inside it (takes a few minutes)
 python3 -m venv ~/.config/litellm/venv
