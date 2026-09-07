@@ -16,6 +16,33 @@ you configure keys **once**, and every tool shares them.
 
 ---
 
+## 0. Get the wizard onto the new machine
+
+This repo is **private**, so GitHub needs to know it's you. One-time login:
+
+```bash
+gh auth login
+# Answer: GitHub.com → HTTPS → Yes → Login with a web browser,
+# then open the shown code link on a machine where you're logged into GitHub.
+```
+
+Then fetch everything (copy-paste beats retyping 1000 lines into nano):
+
+```bash
+cd ~
+gh repo clone mansourvery-hub/litellm-wizard
+ls litellm-wizard   # you should see: wizard.py  litellm.service  README.md
+```
+
+No `gh`? Alternatives, worst first:
+
+- **Copy-paste via nano** (`nano wizard.py`, paste, save) — works but one missed line breaks the script; only for emergencies.
+- **Browser download** — open the repo page → file → download, then move the files.
+- **`git clone https://github.com/mansourvery-hub/litellm-wizard.git`** — same as `gh repo clone`, Git will ask for your username + a
+  personal access token as password (your normal password won't work).
+
+All steps below assume the files sit in `~/litellm-wizard/`.
+
 ## 1. What you need
 
 - Linux (these steps were tested on Arch Linux; any distro works — only the install command in step 2 changes).
@@ -34,9 +61,9 @@ sudo pacman -S --needed python python-virtualenv curl git github-cli
 # 2) Folders
 mkdir -p ~/.config/litellm ~/.config/systemd/user
 
-# 3) Copy wizard.py and litellm.service from this repo into place:
-cp wizard.py ~/.config/litellm/wizard.py
-cp litellm.service ~/.config/systemd/user/litellm.service
+# 3) Put the repo files into place (from section 0's clone):
+cp ~/litellm-wizard/wizard.py ~/.config/litellm/wizard.py
+cp ~/litellm-wizard/litellm.service ~/.config/systemd/user/litellm.service
 
 # 4) Isolated Python box + install LiteLLM inside it (takes a few minutes)
 python3 -m venv ~/.config/litellm/venv
