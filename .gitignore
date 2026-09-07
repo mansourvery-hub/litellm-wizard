@@ -1,0 +1,9 @@
+# NEVER commit real keys or configs — they contain secrets
+providers_db.json
+config.yaml
+*.bak*
+*.backup*
+venv/
+__pycache__/
+*.pyc
+/tmp/
