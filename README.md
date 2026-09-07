@@ -16,6 +16,8 @@ you configure keys **once**, and every tool shares them.
 
 ---
 
+# Part A — First-time setup (do once, top to bottom)
+
 ## 0. Get the wizard onto the new machine
 
 This repo is **private**, so GitHub needs to know it's you. One-time login:
@@ -152,12 +154,25 @@ curl -s http://localhost:4000/v1/chat/completions \
 ## 8. Use it in OpenCode CLI
 
 **Automatic (recommended):** the repo's `sync-opencode.py` writes every gateway alias
-into `opencode.json` for you — no hand-editing, no comma mistakes:
+into `opencode.json` for you — no hand-editing, no comma mistakes. Two ways to run
+it, pick one (they do exactly the same thing):
 
 ```bash
-python3 ~/litellm-wizard/sync-opencode.py          # system python is fine (stdlib only)
-python3 ~/litellm-wizard/sync-opencode.py --dry-run  # preview without changing anything
+cd ~/litellm-wizard && ./sync-opencode.py            # needs the exec bit (chmod +x)
+python3 ~/litellm-wizard/sync-opencode.py            # always works — the guide uses this form
 ```
+
+(Why two spellings? `./file` relies on the file's executable permission, which can get
+lost when copying. `python3 file` states the interpreter explicitly, so it works no
+matter what. The script needs only system python — no venv, no packages.)
+
+Want to see what it *would* do first? Add `--dry-run` — it only prints, changes nothing:
+
+```bash
+python3 ~/litellm-wizard/sync-opencode.py --dry-run
+```
+
+So: run with `--dry-run` when you're nervous, run it plain to actually apply.
 
 It backs up `opencode.json` first, is safe to re-run after every wizard change,
 and validates the result as strict JSON. Then restart the OpenCode TUI and open
@@ -200,11 +215,55 @@ export OPENAI_BASE_URL=http://localhost:4000/v1
 export OPENAI_API_KEY="$LITELLM_MASTER_KEY"
 ```
 
+---
+
+# Part B — Future tweaks (come back here, skip Part A)
+
+Setup is done — everything below reuses it. The rhythm is always:
+**wizard (`litellm-add`) → Q to apply → re-sync OpenCode if models changed.**
+
+## Adding API keys later
+
+```bash
+litellm-add
+# pick the provider (number or: add openrouter) → paste the new keys → DONE
+# keys are tested immediately; models step unlocks only if all pass → Q
+```
+
+Adding keys never breaks OpenCode: the aliases stay the same, so `opencode.json`
+needs no update. (Re-running `sync-opencode.py` afterwards is harmless but unnecessary.)
+
+## Removing API keys later
+
+Same flow — the wizard shows your current keys numbered:
+
+```bash
+litellm-add
+# pick the provider → type REMOVE → enter numbers (e.g. 1,3) → DONE → Q
+```
+
+Removing the *last* key of a provider aborts safely instead of saving a keyless
+provider. If models changed as a side effect, re-run `sync-opencode.py`.
+
+## Adding / removing models later
+
+Pick the provider in the wizard → keys validate → choose from the live catalog
+(free first, `MORE` for paid, `DONE` to finish) → each model is ping-tested (1 word,
+~3 tokens) → Q. Then **always**:
+
+```bash
+python3 ~/litellm-wizard/sync-opencode.py   # refresh opencode.json ...
+```
+
+…**and restart the OpenCode TUI** (it only reads config at startup), then `/models`.
+
+Rule of thumb: **models changed → sync + restart TUI. Keys only → just Q.**
+
 ## 10. Daily use & troubleshooting
 
 | Situation | Command |
 |---|---|
-| Add/change providers | `litellm-add` (Q applies + restarts) |
+| Add/remove keys or models | `litellm-add` (Q applies + restarts; re-sync OpenCode if models changed) |
 | Is it running? | `systemctl --user status litellm.service --no-pager` |
 | What broke? | `journalctl --user -u litellm.service -n 50 --no-pager` |
 | Apply config by hand | `systemctl --user restart litellm.service` |

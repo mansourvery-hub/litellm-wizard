@@ -711,22 +711,47 @@ def test_models(pid, models, key, endpoint=None):
 
 # ---------- input helpers ----------
 
-def input_keys(prompt_name):
+def input_keys(prompt_name, existing=None):
+    """Collect keys. Returns (added, removed): new key strings + existing keys to drop."""
+    existing = list(existing or [])
     print(f"\nEnter API keys for {prompt_name} (paste, space/comma/newline separated).")
+    if existing:
+        print(f"  Current keys ({len(existing)}): " +
+              ", ".join(f"[{i}] {snippet(k)}" for i, k in enumerate(existing, 1)))
+        print("  Type REMOVE to delete some first.")
     print("Type DONE on an empty line when finished (empty = keep existing).")
-    lines = []
+    lines, removed = [], []
     while True:
         try:
             line = input().strip()
         except EOFError:
             break
+        if line.upper() == "REMOVE" and existing:
+            try:
+                nums = input("  Numbers to delete (e.g. 1,3 — empty cancels): ").strip()
+            except EOFError:
+                continue
+            if not nums:
+                continue
+            for tok in nums.replace(",", " ").split():
+                if tok.isdigit() and 1 <= int(tok) <= len(existing):
+                    k = existing[int(tok) - 1]
+                    if k not in removed:
+                        removed.append(k)
+                        print(f"  [-] will delete {snippet(k)}")
+                else:
+                    print(f"  [!] #{tok} out of range")
+            remaining = [k for k in existing if k not in removed]
+            print(f"  Remaining: {', '.join(snippet(k) for k in remaining) or '(none)'}")
+            continue
         if line.upper() == "DONE" or (not line and lines):
             break
         if not line and not lines:
-            return []  # keep existing
+            return [], removed  # keep existing (minus removals)
         if line:
             lines.append(line)
-    return [k.strip() for k in " ".join(lines).replace(",", " ").split() if k.strip()]
+    added = [k.strip() for k in " ".join(lines).replace(",", " ").split() if k.strip()]
+    return added, removed
 
 
 def input_models_manual(pid, pname, existing):
@@ -823,9 +848,11 @@ def configure_provider(db, provider):
 
     # --- step 2: keys + GATE (all must pass before models step) ---
     if ptype not in ("local_ollama",):
-        pending_new = input_keys(pname)
-        # candidate set = existing + new (dedup, preserve order)
-        candidate = list(entry.get("keys", []))
+        pending_new, pending_rm = input_keys(pname, entry.get("keys", []))
+        # candidate set = existing minus removals + new (dedup, preserve order)
+        candidate = [k for k in entry.get("keys", []) if k not in pending_rm]
+        if pending_rm:
+            print(f"  [-] Dropped {len(pending_rm)} key(s).")
         for k in pending_new:
             if k not in candidate:
                 candidate.append(k)
@@ -866,8 +893,8 @@ def configure_provider(db, provider):
                 print("  [!] Saved anyway with failing keys — expect proxy 401s for this provider.")
                 break
             else:  # re-enter
-                pending_new = input_keys(pname + " (retry)")
-                candidate = list(entry.get("keys", []))
+                pending_new, pending_rm = input_keys(pname + " (retry)", entry.get("keys", []))
+                candidate = [k for k in entry.get("keys", []) if k not in pending_rm]
                 for k in pending_new:
                     if k not in candidate:
                         candidate.append(k)
