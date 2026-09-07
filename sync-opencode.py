@@ -68,6 +68,16 @@ def _strip_jsonc(text):
 def load_aliases(litellm_config):
     """Unique LiteLLM model aliases, in config order."""
     if litellm_config and os.path.exists(litellm_config):
+        # Fast path: regex over model_name lines (no PyYAML needed).
+        seen, aliases = set(), []
+        with open(litellm_config) as f:
+            for line in f:
+                m = re.match(r"\s*model_name:\s*(\S+)\s*$", line)
+                if m and m.group(1) not in seen:
+                    seen.add(m.group(1))
+                    aliases.append(m.group(1))
+        if aliases:
+            return aliases, f"config ({litellm_config})"
         try:
             import yaml  # type: ignore
             with open(litellm_config) as f:
@@ -85,9 +95,11 @@ def load_aliases(litellm_config):
     db_path = os.path.join(LITELLM_DIR, "providers_db.json")
     with open(db_path) as f:
         db = json.load(f)
+    pids = ["gemini", "openrouter", "ollama_cloud", "zai", "tokenrouter",
+            "anthropic", "openai", "opencode_zen"]
+    pids += sorted(k for k in db if k.startswith("custom_") and k not in pids)
     seen, aliases = set(), []
-    for pid in ("gemini", "openrouter", "ollama_cloud", "zai", "tokenrouter",
-                "anthropic", "openai", "opencode_zen"):
+    for pid in pids:
         for m in db.get(pid, {}).get("models", []):
             # LiteLLM alias convention: last segment (matches model_name in config.yaml)
             a = m.split("/")[-1] if "/" in m else m
