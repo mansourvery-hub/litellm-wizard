@@ -151,8 +151,20 @@ curl -s http://localhost:4000/v1/chat/completions \
 
 ## 8. Use it in OpenCode CLI
 
-OpenCode treats the gateway as one more provider. In `~/.config/opencode/opencode.json`,
-inside the existing `"provider"` section, add:
+**Automatic (recommended):** the repo's `sync-opencode.py` writes every gateway alias
+into `opencode.json` for you — no hand-editing, no comma mistakes:
+
+```bash
+python3 ~/litellm-wizard/sync-opencode.py          # system python is fine (stdlib only)
+python3 ~/litellm-wizard/sync-opencode.py --dry-run  # preview without changing anything
+```
+
+It backs up `opencode.json` first, is safe to re-run after every wizard change,
+and validates the result as strict JSON. Then restart the OpenCode TUI and open
+`/models` — every alias appears as `litellm/<alias>`.
+
+**Manual alternative:** in `~/.config/opencode/opencode.json`, inside the existing
+`"provider"` section, add (watch the comma after the previous block):
 
 ```json
 "litellm": {
@@ -206,6 +218,7 @@ export OPENAI_API_KEY="$LITELLM_MASTER_KEY"
 | File | What | Secrets? |
 |---|---|---|
 | `wizard.py` | The setup wizard (key tests, live model catalog, per-model tests, config generator) | No — only the default master-key placeholder |
+| `sync-opencode.py` | Writes all gateway aliases into `opencode.json` as a `litellm` provider block (backup + `--dry-run` included) | No |
 | `litellm.service` | systemd unit that runs the gateway on port 4000 | No |
 | `README.md` | This guide | No |
 
