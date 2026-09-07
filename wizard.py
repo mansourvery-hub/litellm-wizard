@@ -1,6 +1,6 @@
 #!/home/mohamed/.config/litellm/venv/bin/python
 """Single unified LiteLLM config wizard: keys -> validated -> models -> loop -> proxy test."""
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 import json
 import os
 import re
@@ -890,6 +890,36 @@ def _custom_entries(db):
     return sorted(out)
 
 
+def _named_custom_provider(db, name):
+    """create_custom_provider for `add <name>`: skips the name prompt, only asks for the base URL.
+
+    Reuses an existing custom slot when the name matches (exact or substring),
+    so adding keys never forks a duplicate provider.
+    """
+    pid = _custom_id(name)
+    if pid not in db:
+        for epid, label in _custom_entries(db):
+            q, l = _norm_name(name), _norm_name(label)
+            if q == l or (len(q) >= 3 and len(l) >= 3 and (q in l or l in q)):
+                pid = epid
+                break
+    base = db.get(pid, {}).get("base_url", "")
+    if not base:
+        try:
+            base = input(f"Base URL for {name} (e.g. https://api.deepseek.com/v1, empty aborts): ").strip().rstrip("/")
+        except (EOFError, KeyboardInterrupt):
+            return None
+    if not base:
+        return None
+    db.setdefault(pid, {"keys": [], "models": [], "endpoints": []})
+    db[pid]["base_url"] = base
+    db[pid]["label"] = name
+    save_db(db)
+    print(f"  [+] Endpoint: {base}")
+    return {"id": pid, "name": f"{name} (custom)", "prefix": "openai/",
+            "base_url": base, "type": "custom_api"}
+
+
 def configure_provider(db, provider):
     pid = provider["id"]
     pname = provider["name"]
@@ -1248,25 +1278,41 @@ def resolve_provider(text, db=None):
     Also matches user-created custom endpoints by label (returns ("C", dyn_dict)).
     """
     q = _norm_name(text)
+    # 1. Exact match against builtins or saved custom entries
     hits = []
     for num, p in PROVIDERS.items():
         names = [_norm_name(p["id"]), _norm_name(p["name"])] + PROVIDER_ALIASES.get(p["id"], [])
         if q in names or any(q == a for a in names):
             hits.append(num)
-    if not hits:
-        hits = [num for num, p in PROVIDERS.items()
-                if any(q in a or a in q for a in
-                       ([_norm_name(p["id"]), _norm_name(p["name"])] + PROVIDER_ALIASES.get(p["id"], [])))]
     if len(hits) == 1:
         return hits[0], PROVIDERS[hits[0]]
     if hits:
         return None, hits
-    # fall through to custom endpoints saved in db
+
     if db:
         for pid, label in _custom_entries(db):
-            if q in (_norm_name(pid), _norm_name(label),
-                     _norm_name(label.replace("(custom)", ""))):
+            names = [_norm_name(pid), _norm_name(label),
+                     _norm_name(label.replace("(custom)", ""))]
+            if q in names or any(q == a for a in names):
                 return "C", _custom_provider_dict(pid, db)
+
+    # 2. Substring match against builtins (ignore 2-char aliases to avoid hijacking)
+    hits = [num for num, p in PROVIDERS.items()
+            if any((q in a or a in q) and len(a) >= 3 for a in
+                   ([_norm_name(p["id"]), _norm_name(p["name"])] + PROVIDER_ALIASES.get(p["id"], [])))]
+    if len(hits) == 1:
+        return hits[0], PROVIDERS[hits[0]]
+    if hits:
+        return None, hits
+
+    # 3. Substring match against saved custom entries (query as prefix/substring of label)
+    if db:
+        for pid, label in _custom_entries(db):
+            names = [_norm_name(pid), _norm_name(label),
+                     _norm_name(label.replace("(custom)", ""))]
+            if any(q in a and len(q) >= 3 for a in names):
+                return "C", _custom_provider_dict(pid, db)
+
     return None, []
 
 
@@ -1444,12 +1490,29 @@ def main():
                         print("  Ambiguous — did you mean:")
                         for n in res:
                             print(f"    [{n}] {PROVIDERS[n]['name']}")
-                    else:
-                        print(f"  [!] No provider matches '{name}'.")
-                        print_unconfigured(db)
+                        continue
+                    try:
+                        ans = input(f"  No provider matches '{name}'. Create a custom endpoint named '{name}'? [y/N]: ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        continue
+                    if ans in ("y", "yes"):
+                        dyn = _named_custom_provider(db, name)
+                        if dyn is None:
+                            continue
+                        try:
+                            configure_provider(db, dyn)
+                            db = load_db()  # re-read (configure saves)
+                        except (KeyboardInterrupt, EOFError):
+                            print("\n[-] Provider step cancelled.")
+                            db = load_db()
                     continue
                 if num == "C":
                     dyn = res
+                elif num == "10":
+                    dyn = create_custom_provider(db)
+                    if dyn is None:
+                        continue
                 else:
                     ch = num
         elif low.startswith("add "):
@@ -1459,11 +1522,29 @@ def main():
                     print("  Ambiguous — did you mean:")
                     for n in res:
                         print(f"    [{n}] {PROVIDERS[n]['name']}")
-                else:
-                    print(f"  [!] No provider matches '{ch[4:]}'. Try 'add' or 'all'.")
+                    continue
+                try:
+                    ans = input(f"  No provider matches '{ch[4:]}'. Create a custom endpoint named '{ch[4:]}'? [y/N]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    continue
+                if ans in ("y", "yes"):
+                    dyn = _named_custom_provider(db, ch[4:])
+                    if dyn is None:
+                        continue
+                    try:
+                        configure_provider(db, dyn)
+                        db = load_db()  # re-read (configure saves)
+                    except (KeyboardInterrupt, EOFError):
+                        print("\n[-] Provider step cancelled.")
+                        db = load_db()
                 continue
             if num == "C":
                 dyn = res
+            elif num == "10":
+                dyn = create_custom_provider(db)
+                if dyn is None:
+                    continue
             else:
                 ch = num
         elif ch.strip() == "10":

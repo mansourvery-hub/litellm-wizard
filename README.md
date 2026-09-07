@@ -256,6 +256,8 @@ through different protocols (the Zen lesson).
 litellm-add
 # pick 10 (or: add custom) → short name (e.g. DeepSeek direct) →
 # base URL (e.g. https://api.deepseek.com/v1) → keys → pick models → Q
+# shortcut: add <name> (e.g. add tokenharbor) — unknown names offer
+# to create a custom endpoint with that name on the spot
 ```
 
 The endpoint is stored alongside the keys, so keys, catalog, and tests all use it.
