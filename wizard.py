@@ -528,7 +528,9 @@ def pick_models(pid, pname, existing, catalog):
     print(f"\nModels for {pname} — live catalog ({len(catalog)} available, no guessing needed).")
     if existing:
         print(f"Already saved: {' '.join(existing)}")
-    print("How to select: numbers/ranges (1,3,5-8) | /filter text | exact IDs | display names | ALL | DONE to finish | CLEAR to reset")
+    print("Pick with commas or spaces: numbers (1,3), ranges (1-5 = 1 through 5),")
+    print("  /filter text, exact IDs, display names — or ALL. Numbers always refer to")
+    print("  the list currently shown. DONE finishes, CLEAR resets your picks.")
     # alias map: normalized id + normalized label -> id
     alias = {}
     for mid, label in catalog:
@@ -764,7 +766,8 @@ def input_keys(prompt_name, existing=None):
         print(f"  Current keys ({len(existing)}): " +
               ", ".join(f"[{i}] {snippet(k)}" for i, k in enumerate(existing, 1)))
         print("  Type REMOVE to delete some first.")
-    print("Type DONE on an empty line when finished (empty = keep existing).")
+    print("Type DONE (or Enter on an empty line) when finished.")
+    print("Finishing with nothing typed = keep the existing keys.")
     lines, removed = [], []
     while True:
         try:
@@ -773,7 +776,7 @@ def input_keys(prompt_name, existing=None):
             break
         if line.upper() == "REMOVE" and existing:
             try:
-                nums = input("  Numbers to delete (e.g. 1,3 — empty cancels): ").strip()
+                nums = input("  Numbers to delete, comma/space separated, no ranges (e.g. 1,3 — empty cancels): ").strip()
             except EOFError:
                 continue
             if not nums:
@@ -807,6 +810,7 @@ def input_models_manual(pid, pname, existing):
         print(MODEL_HINTS["custom"])
     if existing:
         print(f"Current: {' '.join(existing)}")
+    print("Type model IDs separated by commas or spaces.")
     print("Empty = keep current. 'CLEAR' = replace all.")
     try:
         raw = input("Models: ").strip()
@@ -859,7 +863,7 @@ def create_custom_provider(db):
     if cur_base:
         print(f"  Current base URL: {cur_base}")
     try:
-        base = input("Base URL (e.g. https://api.deepseek.com/v1, empty=keep): ").strip().rstrip("/")
+        base = input("Base URL including /v1 if the docs show one (e.g. https://api.deepseek.com/v1).\nEmpty keeps the shown URL, or aborts if this is a new endpoint: ").strip().rstrip("/")
     except (EOFError, KeyboardInterrupt):
         return None
     if not base:
@@ -901,10 +905,13 @@ def configure_provider(db, provider):
         if cur:
             print(f"  Current endpoint(s): {' '.join(cur)}")
         try:
-            ep = input(f"Local Ollama URL (default http://localhost:11434, empty=keep): ").strip()
+            ep = input(f"Local Ollama URL (default http://localhost:11434 — empty keeps saved, or uses default): ").strip()
         except EOFError:
             return False
         endpoints = cur if not ep else [ep]
+        if not endpoints:
+            endpoints = ["http://localhost:11434"]
+            entry["endpoints"] = endpoints
         if endpoints != cur:
             entry["endpoints"] = endpoints
         # GATE: endpoint must be reachable before models step
@@ -917,7 +924,7 @@ def configure_provider(db, provider):
             nxt = input("  Endpoint unreachable. [R]etry / [C]hange / [A]bort? ").strip().lower()
             if nxt == "c":
                 try:
-                    ep = input("Local Ollama URL: ").strip()
+                    ep = input("Local Ollama URL (empty keeps the current one): ").strip()
                 except EOFError:
                     db[pid] = saved_snapshot
                     return False
@@ -935,7 +942,7 @@ def configure_provider(db, provider):
         if cur:
             print(f"  Current endpoint(s): {' '.join(cur)}")
         try:
-            ep = input("Remote Ollama base URL (empty=keep): ").strip()
+            ep = input("Remote Ollama base URL (empty keeps saved — required the first time): ").strip()
         except EOFError:
             return False
         if ep and ep not in entry["endpoints"]:
@@ -962,7 +969,7 @@ def configure_provider(db, provider):
         if pid == "custom" or pid.startswith("custom_"):
             if not entry.get("base_url") and not provider.get("base_url"):
                 try:
-                    b = input("Base URL (e.g. https://api.provider.com/v1): ").strip().rstrip("/")
+                    b = input("Base URL including /v1 if the docs show one (empty aborts): ").strip().rstrip("/")
                 except (EOFError, KeyboardInterrupt):
                     db[pid] = saved_snapshot
                     return False
@@ -984,7 +991,7 @@ def configure_provider(db, provider):
                 print("  [+] All keys valid — proceeding to models.")
                 break
             print(f"  [!] {len(bad)}/{len(results)} key(s) FAILED. Next step blocked until all OK.")
-            print("  Options: [R]e-enter keys  [K]eep only valid  [S]ave anyway (not recommended)  [A]bort (discard changes)")
+            print("  [R]e-enter keys / [K]eep only valid ones / [S]ave anyway (expect errors later) / [A]bort")
             try:
                 ch = input("  Choice [R/K/S/A]: ").strip().lower()
             except EOFError:
@@ -1080,7 +1087,7 @@ def _models_step(db, provider, avail, catalog, keys, endpoints):
                 print("  [+] All models passed (or throttled-but-valid) — saving.")
                 break
             print(f"  [!] {len(fails)}/{len(results)} model(s) FAILED. Save blocked.")
-            print("  Options: [K]eep passing only  [R]e-pick  [A]bort (discard model changes)")
+            print("  [K]eep passing ones only / [R]e-pick models / [A]bort without saving")
             try:
                 ch = input("  Choice [K/R/A]: ").strip().lower()
             except EOFError:
@@ -1288,7 +1295,7 @@ def main():
     show_all = False
     while True:
         print_status(db, verbose=show_all)
-        print("\n[#] number | add <name> (e.g. add google) | all | [T] proxy test | [Q] save+restart+quit")
+        print("\n[#] number | add <name> (e.g. add google; bare add browses missing) | all | [T] proxy test | [Q] save+restart+quit")
         try:
             ch = input("Choice: ").strip()
         except (EOFError, KeyboardInterrupt):
