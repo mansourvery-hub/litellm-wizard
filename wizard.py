@@ -1,6 +1,6 @@
 #!/home/mohamed/.config/litellm/venv/bin/python
 """Single unified LiteLLM config wizard: keys -> validated -> models -> loop -> proxy test."""
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 import json
 import os
 import re
@@ -1285,6 +1285,114 @@ def print_unconfigured(db):
             print(f"    [{num}] {p['name']}")
 
 
+def _strip_jsonc_wiz(text):
+    """Remove // and /* */ comments (outside strings) + trailing commas."""
+    out, i, n, in_str, esc = [], 0, len(text), False, False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            esc = (c == "\\" and not esc)
+            if c == '"' and not esc:
+                in_str = False
+            elif c != "\\":
+                esc = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
+def _gateway_aliases():
+    """Unique model aliases from the generated config (regex, no yaml needed)."""
+    try:
+        with open(YAML_FILE) as f:
+            seen, aliases = set(), []
+            for line in f:
+                m = re.match(r"^\s*(?:-\s*)?model_name:\s*(\S+)\s*$", line)
+                if m and m.group(1) not in seen:
+                    seen.add(m.group(1))
+                    aliases.append(m.group(1))
+            return aliases
+    except OSError:
+        return []
+
+
+def _opencode_litellm_models(path):
+    """Model keys of the litellm block, or None if missing/unparseable."""
+    try:
+        with open(path) as f:
+            cfg = json.loads(_strip_jsonc_wiz(f.read()))
+        return list((cfg.get("provider", {}) or {}).get("litellm", {}).get("models", {}).keys())
+    except (OSError, ValueError):
+        return None
+
+
+def maybe_sync_opencode():
+    """Q-time offer: sync gateway aliases into opencode.json. Never raises."""
+    import datetime
+    path = os.environ.get("OPENCODE_JSON", os.path.join(os.path.expanduser("~"), ".config", "opencode", "opencode.json"))
+    try:
+        if not os.path.exists(path):
+            print(f"  [i] No OpenCode config at {path} — skipping sync.")
+            return
+        aliases = _gateway_aliases()
+        if not aliases:
+            print("  [!] No gateway aliases found — skipping sync.")
+            return
+        current = _opencode_litellm_models(path)
+        if current is None:
+            print(f"  [!] Could not parse {path} — leaving it untouched.")
+            return
+        if set(current) == set(aliases):
+            print(f"  [=] opencode.json already in sync ({len(aliases)} models).")
+            return
+        try:
+            ans = input(f"  opencode.json lists {len(current)}, gateway serves {len(aliases)} — sync to opencode.json? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  [-] Sync skipped.")
+            return
+        if ans not in ("", "y", "yes"):
+            print("  [-] Left opencode.json unchanged (manual: sync-opencode.py).")
+            return
+        with open(path) as f:
+            cfg = json.loads(_strip_jsonc_wiz(f.read()))
+        cfg.setdefault("provider", {})["litellm"] = {
+            "npm": "@ai-sdk/openai-compatible",
+            "name": "Local LiteLLM",
+            "options": {"baseURL": "http://localhost:4000/v1",
+                        "apiKey": "{env:LITELLM_MASTER_KEY}"},
+            "models": {a: {"name": a} for a in aliases},
+        }
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = f"{path}.bak-{stamp}"
+        import shutil
+        shutil.copy2(path, backup)
+        with open(path, "w") as f:
+            json.dump(cfg, f, indent=2)
+            f.write("\n")
+        json.load(open(path))  # strict sanity check
+        print(f"  [+] Synced {len(aliases)} models (backup: {backup}). Restart the OpenCode TUI, then /models.")
+    except Exception as e:
+        print(f"  [!] Sync failed safely ({str(e)[:120]}). Gateway config is unaffected.")
+
+
 def main():
     if "--version" in sys.argv or "-v" in sys.argv:
         print(__version__)
@@ -1306,6 +1414,7 @@ def main():
             save_db(db)
             n = generate_yaml(db)
             print(f"[+] Final config: {n} routes.")
+            maybe_sync_opencode()
             restart_proxy()
             print("[+] Bye. (Full proxy test available via [T].)")
             break

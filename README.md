@@ -275,6 +275,8 @@ python3 ~/litellm-wizard/sync-opencode.py   # refresh opencode.json ...
 …**and restart the OpenCode TUI** (it only reads config at startup), then `/models`.
 
 Rule of thumb: **models changed → sync + restart TUI. Keys only → just Q.**
+Quitting the wizard now offers the sync itself when `opencode.json` is stale
+(Enter = yes, anything else leaves it for a manual `sync-opencode.py` run).
 
 ## 10. Daily use & troubleshooting
 
