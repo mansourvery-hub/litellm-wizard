@@ -1,7 +1,9 @@
 #!/home/mohamed/.config/litellm/venv/bin/python
 """Single unified LiteLLM config wizard: keys -> validated -> models -> loop -> proxy test."""
+__version__ = "1.5.0"
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -39,6 +41,7 @@ PROVIDERS = {
     "7": {"id": "zai", "name": "Z.AI (GLM Models)", "prefix": "openai/", "base_url": "https://api.z.ai/api/paas/v4", "type": "custom_api"},
     "8": {"id": "ollama_cloud", "name": "Ollama Cloud / Hosted Remote", "prefix": "ollama/", "type": "remote_ollama"},
     "9": {"id": "ollama_local", "name": "Local Ollama Engine", "prefix": "ollama/", "type": "local_ollama"},
+    "10": {"id": "custom", "name": "Custom OpenAI-compatible endpoint", "prefix": "openai/", "type": "custom_api"},
 }
 
 MODEL_HINTS = {
@@ -49,6 +52,7 @@ MODEL_HINTS = {
     "ollama_local": "Examples: qwen2.5-coder:7b, llama3.3:70b",
     "gemini": "Examples: gemini-3.8-flash, gemini-3.5-flash, gemini-3.1-pro-preview",
     "openrouter": "Examples: minimax/minimax-m3:free, nvidia/nemotron-3.5-lightning:free",
+    "custom": "Pick from the live catalog fetched from YOUR base URL — no guessing needed",
 }
 
 
@@ -75,6 +79,11 @@ def generate_yaml(db_data):
 
     for provider_id, pdata in db_data.items():
         p_info = next((p for p in PROVIDERS.values() if p["id"] == provider_id), None)
+        if not p_info and (provider_id == "custom" or provider_id.startswith("custom_")):
+            if not pdata.get("base_url"):
+                continue  # custom entry without endpoint: nothing to route
+            p_info = {"id": provider_id, "name": pdata.get("label", provider_id),
+                      "prefix": "openai/", "type": "custom_api"}
         if not p_info:
             continue
 
@@ -109,10 +118,13 @@ def generate_yaml(db_data):
                         })
 
         elif p_type == "custom_api":
-            # Per-entry base_url override wins (e.g. TokenRouter .com vs .io auto-detect)
-            base_url = pdata.get("base_url") or p_info["base_url"]
+            # Per-entry base_url override wins (e.g. TokenRouter .com vs .io auto-detect,
+            # custom providers always store their own base_url)
+            base_url = pdata.get("base_url") or p_info.get("base_url")
+            if not base_url:
+                continue
             for m in models:
-                if provider_id == "tokenrouter":
+                if provider_id == "tokenrouter" or provider_id == "custom" or provider_id.startswith("custom_"):
                     mid, alias = m, (m.split("/")[-1] if "/" in m else m)
                 else:
                     # Strip opencode/ prefix for Zen: upstream expects bare ID
@@ -328,6 +340,17 @@ def _ollama_local_ep(endpoint):
     return False, f"HTTP {s}: {raw[:150]}", None
 
 
+def _oai_compat_models(base, key):
+    """Generic OpenAI-compatible GET {base}/models. Returns (ok, msg, [(id,label)]|None)."""
+    s, d, raw = _get(f"{base.rstrip('/')}/models", {"Authorization": f"Bearer {key}"})
+    if s == 200 and d and "data" in d:
+        items = sorted([(m["id"], m.get("name") or m["id"]) for m in d["data"] if m.get("id")])
+        return True, f"OK @ {base.rstrip('/')} ({len(items)} models)", items
+    if s in (401, 403):
+        return False, f"invalid key (HTTP {s})", None
+    return False, f"HTTP {s}: {raw[:150]}", None
+
+
 def validate_keys(pid, keys, endpoints):
     """Test every key directly. Returns (results, available_models|None).
 
@@ -396,6 +419,17 @@ def validate_keys(pid, keys, endpoints):
             results.append((k, ok, msg))
     elif pid == "ollama_local":
         pass  # endpoint validated separately
+    elif pid == "custom" or pid.startswith("custom_"):
+        base = (endpoints or [None])[0]
+        if not base:
+            print("      [FAIL] no base URL stored for custom provider")
+            return [(k, False, "no base URL") for k in keys], None
+        for k in keys:
+            ok, msg, items = _oai_compat_models(base, k)
+            if items and avail is None:
+                avail = [mid for mid, _ in items]
+            print(f"      [{'OK' if ok else 'FAIL'}] {snippet(k)} -> {msg}")
+            results.append((k, ok, msg))
     return results, avail
 
 
@@ -451,6 +485,11 @@ def fetch_catalog(pid, key, endpoint=None):
                 if s == 200 and d and isinstance(d.get("data"), list):
                     return sorted([(m["id"], m.get("name") or m["id"]) for m in d["data"] if m.get("id")])
             return None
+        if pid == "custom" or pid.startswith("custom_"):
+            if not endpoint:
+                return None
+            ok, _, items = _oai_compat_models(endpoint, key)
+            return items if ok else None
         if pid == "zai":
             s, d, _ = _get("https://api.z.ai/api/paas/v4/models",
                            {"Authorization": f"Bearer {key}"})
@@ -652,11 +691,17 @@ def test_single_model(pid, model, key, endpoint=None):
                               {"model": model, "messages": [{"role": "user", "content": "hi"}],
                                "max_tokens": 1},
                               {"Authorization": f"Bearer {key}"})
-        elif pid in ("opencode_zen", "tokenrouter", "zai"):
+        elif pid in ("opencode_zen", "tokenrouter", "zai") or pid == "custom" or pid.startswith("custom_"):
             if pid == "tokenrouter":
                 bases = [endpoint] if endpoint else TOKENROUTER_BASES
                 mid = model  # .com needs full prefixed ID (z-ai/...)
                 to = 90  # cold starts are slow
+            elif pid == "custom" or pid.startswith("custom_"):
+                if not endpoint:
+                    return "FAIL", "no base URL stored for custom provider"
+                bases = [endpoint]
+                mid = model  # keep full ID from catalog
+                to = 60
             else:
                 bases = [{"opencode_zen": "https://opencode.ai/zen/v1",
                           "zai": "https://api.z.ai/api/paas/v4"}[pid]]
@@ -758,6 +803,8 @@ def input_models_manual(pid, pname, existing):
     print(f"\nModels for {pname} (manual entry — catalog unreachable).")
     if pid in MODEL_HINTS:
         print(MODEL_HINTS[pid])
+    elif pid == "custom" or pid.startswith("custom_"):
+        print(MODEL_HINTS["custom"])
     if existing:
         print(f"Current: {' '.join(existing)}")
     print("Empty = keep current. 'CLEAR' = replace all.")
@@ -786,6 +833,58 @@ def check_models_against_available(models, available):
 
 
 # ---------- per-provider flow with validation gate ----------
+
+def _custom_id(name):
+    slug = re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_") or "endpoint"
+    return f"custom_{slug}"
+
+
+def create_custom_provider(db):
+    """Prompt for name + base URL of an OpenAI-compatible endpoint.
+
+    Returns a dynamic provider dict (or None on abort). The entry is created
+    in db immediately so keys/models/steps below have somewhere to live.
+    """
+    print("\nCustom OpenAI-compatible endpoint (DeepSeek direct, Groq, Mistral, xAI, Together, ...)")
+    print("Works with any API shaped like OpenAI: GET {base}/models + POST {base}/chat/completions.")
+    try:
+        name = input("Short name (e.g. DeepSeek direct): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if not name:
+        print("  [!] Name required.")
+        return None
+    pid = _custom_id(name)
+    cur_base = db.get(pid, {}).get("base_url", "")
+    if cur_base:
+        print(f"  Current base URL: {cur_base}")
+    try:
+        base = input("Base URL (e.g. https://api.deepseek.com/v1, empty=keep): ").strip().rstrip("/")
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if not base:
+        base = cur_base
+    if not base:
+        print("  [!] Base URL required.")
+        return None
+    if pid not in db:
+        db[pid] = {"keys": [], "models": [], "endpoints": []}
+    db[pid]["base_url"] = base
+    db[pid]["label"] = name
+    save_db(db)
+    print(f"  [+] Endpoint: {base}")
+    return {"id": pid, "name": f"{name} (custom)", "prefix": "openai/",
+            "base_url": base, "type": "custom_api"}
+
+
+def _custom_entries(db):
+    """(pid, label) for user-created custom endpoints, sorted."""
+    out = []
+    for pid, entry in db.items():
+        if pid == "custom" or pid.startswith("custom_"):
+            out.append((pid, entry.get("label") or pid))
+    return sorted(out)
+
 
 def configure_provider(db, provider):
     pid = provider["id"]
@@ -860,7 +959,23 @@ def configure_provider(db, provider):
             print("  [!] No keys (existing or new). Aborting provider.")
             db[pid] = saved_snapshot
             return False
-        endpoints = entry.get("endpoints", [])
+        if pid == "custom" or pid.startswith("custom_"):
+            if not entry.get("base_url") and not provider.get("base_url"):
+                try:
+                    b = input("Base URL (e.g. https://api.provider.com/v1): ").strip().rstrip("/")
+                except (EOFError, KeyboardInterrupt):
+                    db[pid] = saved_snapshot
+                    return False
+                if not b:
+                    print("  [!] Base URL required for custom providers.")
+                    db[pid] = saved_snapshot
+                    return False
+                entry["base_url"] = b
+            elif provider.get("base_url"):
+                entry["base_url"] = provider["base_url"]
+            endpoints = [entry["base_url"]]
+        else:
+            endpoints = entry.get("endpoints", [])
         while True:
             results, avail = validate_keys(pid, candidate, endpoints)
             bad = [r for r in results if not r[1]]
@@ -912,10 +1027,15 @@ def configure_provider(db, provider):
                 entry["base_url"] = tr_base
                 print(f"  [+] TokenRouter endpoint: {tr_base}")
                 ep0 = tr_base
+        if (pid == "custom" or pid.startswith("custom_")) and entry.get("base_url"):
+            ep0 = entry["base_url"]
         catalog = fetch_catalog(pid, entry["keys"][0], ep0) if entry.get("keys") else None
         if not catalog and avail:
             catalog = [(m, m) for m in avail]
-        step_ep = [entry["base_url"]] if pid == "tokenrouter" and entry.get("base_url") else entry.get("endpoints", [])
+        if (pid == "custom" or pid.startswith("custom_")) and entry.get("base_url"):
+            step_ep = [entry["base_url"]]
+        else:
+            step_ep = [entry["base_url"]] if pid == "tokenrouter" and entry.get("base_url") else entry.get("endpoints", [])
         return _models_step(db, provider, avail, catalog, entry.get("keys", []),
                             step_ep)
     return False
@@ -1071,14 +1191,26 @@ def print_status(db, verbose=False):
         for num in sorted(PROVIDERS, key=int):
             p = PROVIDERS[num]
             print(_status_line(num, p, db.get(p["id"], {})))
+        for pid, label in _custom_entries(db):
+            e = db.get(pid, {})
+            print(f"  [C] {label + ' (custom)':<30} keys={len(e.get('keys', [])):<3} "
+                  f"models={len(e.get('models', [])):<3} {' '.join(e.get('models', [])[:4])}")
         return
     print("\nConfigured:")
     any_cfg = False
     for num in sorted(PROVIDERS, key=int):
         p = PROVIDERS[num]
+        if p["id"] == "custom":
+            continue  # template, not a real endpoint
         e = db.get(p["id"], {})
         if _is_configured(e):
             print(_status_line(num, p, e))
+            any_cfg = True
+    for pid, label in _custom_entries(db):
+        e = db.get(pid, {})
+        if _is_configured(e):
+            print(f"  [C] {label + ' (custom)':<30} keys={len(e.get('keys', [])):<3} "
+                  f"models={len(e.get('models', [])):<3} {' '.join(e.get('models', [])[:4])}")
             any_cfg = True
     if not any_cfg:
         print("  (none yet — use: add <name>, e.g. add gemini)")
@@ -1095,6 +1227,7 @@ PROVIDER_ALIASES = {
     "ollama_cloud": ["ollama_cloud", "ollama cloud", "remote ollama", "ollama remote",
                      "hosted ollama", "ollama hosted"],
     "ollama_local": ["ollama_local", "ollama local", "local ollama", "local", "localhost"],
+    "custom": ["custom", "custom provider", "custom endpoint", "other", "new provider"],
 }
 
 
@@ -1102,8 +1235,11 @@ def _norm_name(s):
     return s.strip().lower().replace("_", " ").replace(".", " ").replace("-", " ")
 
 
-def resolve_provider(text):
-    """Fuzzy name -> (num, provider) | (None, [candidate nums]) | (None, [])."""
+def resolve_provider(text, db=None):
+    """Fuzzy name -> (num, provider) | (None, [candidate nums]) | (None, []).
+
+    Also matches user-created custom endpoints by label (returns ("C", dyn_dict)).
+    """
     q = _norm_name(text)
     hits = []
     for num, p in PROVIDERS.items():
@@ -1116,7 +1252,22 @@ def resolve_provider(text):
                        ([_norm_name(p["id"]), _norm_name(p["name"])] + PROVIDER_ALIASES.get(p["id"], [])))]
     if len(hits) == 1:
         return hits[0], PROVIDERS[hits[0]]
-    return None, hits
+    if hits:
+        return None, hits
+    # fall through to custom endpoints saved in db
+    if db:
+        for pid, label in _custom_entries(db):
+            if q in (_norm_name(pid), _norm_name(label),
+                     _norm_name(label.replace("(custom)", ""))):
+                return "C", _custom_provider_dict(pid, db)
+    return None, []
+
+
+def _custom_provider_dict(pid, db):
+    entry = db.get(pid, {})
+    label = entry.get("label") or pid
+    return {"id": pid, "name": f"{label} (custom)", "prefix": "openai/",
+            "base_url": entry.get("base_url", ""), "type": "custom_api"}
 
 
 def print_unconfigured(db):
@@ -1128,8 +1279,11 @@ def print_unconfigured(db):
 
 
 def main():
+    if "--version" in sys.argv or "-v" in sys.argv:
+        print(__version__)
+        return
     db = load_db()
-    print("=== Universal LiteLLM Wizard (single wizard: keys->test->models->loop->proxy test) ===")
+    print(f"=== Universal LiteLLM Wizard v{__version__} (keys->test->models->loop->proxy test) ===")
     print("Keys are tested DIRECTLY after entry; models step unlocks only if all keys OK.")
     show_all = False
     while True:
@@ -1154,16 +1308,21 @@ def main():
         if low in ("all", "list", "ls"):
             show_all = not show_all
             continue
+        dyn = None  # dynamic custom-endpoint dict when resolved/created below
         if low == "add":
             print_unconfigured(db)
             try:
                 name = input("Provider name/number to add: ").strip()
             except (EOFError, KeyboardInterrupt):
                 continue
-            if name in PROVIDERS:
+            if name in PROVIDERS and name != "10":
                 ch = name
+            elif name == "10":
+                dyn = create_custom_provider(db)
+                if dyn is None:
+                    continue
             else:
-                num, res = resolve_provider(name)
+                num, res = resolve_provider(name, db)
                 if num is None:
                     if res:
                         print("  Ambiguous — did you mean:")
@@ -1173,9 +1332,12 @@ def main():
                         print(f"  [!] No provider matches '{name}'.")
                         print_unconfigured(db)
                     continue
-                ch = num
+                if num == "C":
+                    dyn = res
+                else:
+                    ch = num
         elif low.startswith("add "):
-            num, res = resolve_provider(ch[4:])
+            num, res = resolve_provider(ch[4:], db)
             if num is None:
                 if res:
                     print("  Ambiguous — did you mean:")
@@ -1184,7 +1346,22 @@ def main():
                 else:
                     print(f"  [!] No provider matches '{ch[4:]}'. Try 'add' or 'all'.")
                 continue
-            ch = num
+            if num == "C":
+                dyn = res
+            else:
+                ch = num
+        elif ch.strip() == "10":
+            dyn = create_custom_provider(db)
+            if dyn is None:
+                continue
+        if dyn is not None:
+            try:
+                configure_provider(db, dyn)
+                db = load_db()  # re-read (configure saves)
+            except (KeyboardInterrupt, EOFError):
+                print("\n[-] Provider step cancelled.")
+                db = load_db()
+            continue
         if ch not in PROVIDERS:
             print("Invalid choice. Try: <number>, add <name>, all, T, Q.")
             continue

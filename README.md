@@ -245,6 +245,23 @@ litellm-add
 Removing the *last* key of a provider aborts safely instead of saving a keyless
 provider. If models changed as a side effect, re-run `sync-opencode.py`.
 
+## Adding a provider that's not in the list
+
+Any API shaped like OpenAI works (DeepSeek direct, Groq, Mistral, xAI, Together…):
+it needs `GET {base}/models` + `POST {base}/chat/completions` with a Bearer key.
+Anthropic-native or Gemini-native APIs are not supported — LiteLLM speaks to them
+through different protocols (the Zen lesson).
+
+```bash
+litellm-add
+# pick 10 (or: add custom) → short name (e.g. DeepSeek direct) →
+# base URL (e.g. https://api.deepseek.com/v1) → keys → pick models → Q
+```
+
+The endpoint is stored alongside the keys, so keys, catalog, and tests all use it.
+Your custom shows as `[C] Name (custom)` and is found by `add <name>`.
+Afterwards: `sync-opencode.py` + restart the TUI, same as any model change.
+
 ## Adding / removing models later
 
 Pick the provider in the wizard → keys validate → choose from the live catalog
