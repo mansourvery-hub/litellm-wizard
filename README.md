@@ -280,6 +280,21 @@ Rule of thumb: **models changed → sync + restart TUI. Keys only → just Q.**
 Quitting the wizard now offers the sync itself when `opencode.json` is stale
 (Enter = yes, anything else leaves it for a manual `sync-opencode.py` run).
 
+## Updating the wizard itself
+
+`litellm-add` doesn't run this repo's file — it runs a copy you installed at
+`~/.config/litellm/wizard.py`. So after pulling new versions (or editing code
+here), copy it over and keep the exec bit, otherwise `litellm-add` keeps using
+the old code:
+
+```bash
+cp ~/litellm-wizard/wizard.py ~/.config/litellm/wizard.py
+chmod +x ~/.config/litellm/wizard.py
+```
+
+(Only `wizard.py` lives in both places. `sync-opencode.py` is meant to run
+from the repo directly.)
+
 ## 10. Daily use & troubleshooting
 
 | Situation | Command |

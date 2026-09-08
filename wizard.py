@@ -1,6 +1,6 @@
 #!/home/mohamed/.config/litellm/venv/bin/python
 """Single unified LiteLLM config wizard: keys -> validated -> models -> loop -> proxy test."""
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 import json
 import os
 import re
@@ -74,10 +74,96 @@ def snippet(k):
     return f"...{k[-6:]}" if len(k) > 6 else k
 
 
+ALIAS_KEY = "_aliases"
+
+
+def _get_aliases(db_data):
+    """Return unified alias map {canonical: [{provider, model},...]} or {}."""
+    a = db_data.get(ALIAS_KEY)
+    if isinstance(a, dict):
+        return a
+    # legacy key
+    b = db_data.get("_unified")
+    if isinstance(b, dict):
+        return b
+    return {}
+
+
 def generate_yaml(db_data):
     model_list = []
+    # Unified aliases -> single gateway alias fanning out across providers/models
+    # Covered tracks (pid, model) that are already emitted via aliases so
+    # normal per-provider loop does not double-emit the bare alias.
+    aliases = _get_aliases(db_data)
+    covered = set()
+    for canonical, members in list(aliases.items()):
+        if not isinstance(canonical, str) or not canonical.strip():
+            continue
+        canonical = canonical.strip()
+        if not isinstance(members, list):
+            continue
+        for mem in members:
+            if not isinstance(mem, dict):
+                continue
+            pid = mem.get("provider")
+            m = mem.get("model")
+            if not pid or not m:
+                continue
+            pdata = db_data.get(pid)
+            if not pdata:
+                continue
+            if m not in (pdata.get("models") or []):
+                continue  # stale member (model removed) -> skip silently
+            covered.add((pid, m))
+            p_info = next((p for p in PROVIDERS.values() if p["id"] == pid), None)
+            if not p_info and (pid == "custom" or pid.startswith("custom_")):
+                if not pdata.get("base_url"):
+                    continue
+                p_info = {"id": pid, "name": pdata.get("label", pid),
+                          "prefix": "openai/", "type": "custom_api"}
+            if not p_info:
+                continue
+            p_type = p_info.get("type")
+            prefix = p_info.get("prefix", "")
+            keys = pdata.get("keys", [])
+            endpoints = pdata.get("endpoints", [])
+            if p_type == "local_ollama":
+                for endpoint in endpoints:
+                    model_list.append({
+                        "model_name": canonical,
+                        "litellm_params": {"model": f"ollama/{m}", "api_base": endpoint}
+                    })
+            elif p_type == "remote_ollama":
+                for endpoint in endpoints:
+                    for k in keys:
+                        model_list.append({
+                            "model_name": canonical,
+                            "litellm_params": {"model": f"ollama/{m}", "api_base": endpoint, "api_key": k}
+                        })
+            elif p_type == "custom_api":
+                base_url = pdata.get("base_url") or p_info.get("base_url")
+                if not base_url:
+                    continue
+                if pid == "tokenrouter" or pid == "custom" or pid.startswith("custom_"):
+                    mid = m
+                else:
+                    mid = m.split("/")[-1] if "/" in m else m
+                for k in keys:
+                    model_list.append({
+                        "model_name": canonical,
+                        "litellm_params": {"model": f"openai/{mid}", "api_base": base_url, "api_key": k}
+                    })
+            elif p_type == "api":
+                full_model_path = f"{prefix}{m}" if not m.startswith(prefix) else m
+                for k in keys:
+                    entry = {"model_name": canonical, "litellm_params": {"model": full_model_path, "api_key": k}}
+                    if pid == "gemini":
+                        entry["litellm_params"]["rpm"] = 15
+                    model_list.append(entry)
 
     for provider_id, pdata in db_data.items():
+        if provider_id == ALIAS_KEY or provider_id == "_unified":
+            continue
         p_info = next((p for p in PROVIDERS.values() if p["id"] == provider_id), None)
         if not p_info and (provider_id == "custom" or provider_id.startswith("custom_")):
             if not pdata.get("base_url"):
@@ -96,6 +182,8 @@ def generate_yaml(db_data):
         if p_type == "local_ollama":
             for endpoint in endpoints:
                 for m in models:
+                    if (provider_id, m) in covered:
+                        continue
                     model_list.append({
                         "model_name": m,
                         "litellm_params": {
@@ -107,6 +195,8 @@ def generate_yaml(db_data):
         elif p_type == "remote_ollama":
             for endpoint in endpoints:
                 for m in models:
+                    if (provider_id, m) in covered:
+                        continue
                     for k in keys:
                         model_list.append({
                             "model_name": m,
@@ -124,6 +214,8 @@ def generate_yaml(db_data):
             if not base_url:
                 continue
             for m in models:
+                if (provider_id, m) in covered:
+                    continue
                 if provider_id == "tokenrouter" or provider_id == "custom" or provider_id.startswith("custom_"):
                     mid, alias = m, (m.split("/")[-1] if "/" in m else m)
                 else:
@@ -142,6 +234,8 @@ def generate_yaml(db_data):
 
         elif p_type == "api":
             for m in models:
+                if (provider_id, m) in covered:
+                    continue
                 alias = m.split("/")[-1] if "/" in m else m
                 full_model_path = f"{prefix}{m}" if not m.startswith(prefix) else m
 
@@ -162,7 +256,17 @@ def generate_yaml(db_data):
         "router_settings": {
             "routing_strategy": "usage-based-routing-v2",
             "num_retries": 3,
-            "cooldown_time": 60
+            "cooldown_time": 60,
+            "retry_policy": {
+                "BadRequestErrorRetries": 3,
+                "AuthenticationErrorRetries": 3,
+                "TimeoutErrorRetries": 3,
+                "RateLimitErrorRetries": 3,
+                "ContentPolicyViolationErrorRetries": 3,
+                "InternalServerErrorRetries": 3,
+                "ServiceUnavailableErrorRetries": 3,
+                "DefaultRetries": 3
+            }
         },
         "general_settings": {
             "master_key": MASTER_KEY
@@ -177,11 +281,40 @@ def generate_yaml(db_data):
 
 # ---------- direct provider validation (no proxy needed) ----------
 
+def _valid_url(url):
+    """Coerce a user-supplied base URL into a usable form, or return None.
+
+    Auto-prefix https:// when a scheme is missing and never let invalid URLs
+    escape into urllib (which raises ValueError("unknown url type") instead
+    of returning a clean error).
+    """
+    url = (url or "").strip()
+    if not url:
+        return None
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        host = url.split("/")[0]
+        if host.startswith("localhost") or host.startswith("127.") or host == "[::1]":
+            url = "http://" + url
+        else:
+            url = "https://" + url
+    try:
+        urllib.parse.urlparse(url)
+    except Exception:
+        return None
+    return url
+
+
 def _get(url, headers=None, timeout=TIMEOUT):
     """GET JSON. Returns (status:int|None, data:dict|None, raw:str)."""
+    url = _valid_url(url)
+    if not url:
+        return None, None, "invalid URL"
     h = dict(UA)
     h.update(headers or {})
-    req = urllib.request.Request(url, headers=h, method="GET")
+    try:
+        req = urllib.request.Request(url, headers=h, method="GET")
+    except Exception as e:
+        return None, None, str(e)[:300]
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read().decode(errors="replace")
@@ -204,11 +337,17 @@ def _get(url, headers=None, timeout=TIMEOUT):
 
 def _post(url, payload, headers=None, timeout=30):
     """POST JSON. Returns (status:int|None, data:dict|None, raw:str)."""
+    url = _valid_url(url)
+    if not url:
+        return None, None, "invalid URL"
     h = dict(UA)
     h.update(headers or {})
     h["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
-                                 headers=h, method="POST")
+    try:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                     headers=h, method="POST")
+    except Exception as e:
+        return None, None, str(e)[:300]
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read().decode(errors="replace")
@@ -871,6 +1010,10 @@ def create_custom_provider(db):
     if not base:
         print("  [!] Base URL required.")
         return None
+    base = _valid_url(base)
+    if not base:
+        print("  [!] Invalid Base URL (expected e.g. https://api.deepseek.com/v1).")
+        return None
     if pid not in db:
         db[pid] = {"keys": [], "models": [], "endpoints": []}
     db[pid]["base_url"] = base
@@ -910,6 +1053,10 @@ def _named_custom_provider(db, name):
         except (EOFError, KeyboardInterrupt):
             return None
     if not base:
+        return None
+    base = _valid_url(base)
+    if not base:
+        print(f"  [!] Invalid Base URL for {name} (expected e.g. https://api.deepseek.com/v1).")
         return None
     db.setdefault(pid, {"keys": [], "models": [], "endpoints": []})
     db[pid]["base_url"] = base
@@ -1005,6 +1152,11 @@ def configure_provider(db, provider):
                     return False
                 if not b:
                     print("  [!] Base URL required for custom providers.")
+                    db[pid] = saved_snapshot
+                    return False
+                b = _valid_url(b)
+                if not b:
+                    print("  [!] Invalid Base URL (expected e.g. https://api.deepseek.com/v1).")
                     db[pid] = saved_snapshot
                     return False
                 entry["base_url"] = b
@@ -1142,6 +1294,12 @@ def _models_step(db, provider, avail, catalog, keys, endpoints):
                         return False
     else:
         check_models_against_available(candidate, avail)
+    # --- auto-unify every stem appearing >=2 times across providers (silent) ---
+    # respects version and tier (flash/pro/lite never merged) via canonical_stem
+    try:
+        _auto_unify_stems(db, pid, candidate)
+    except Exception as e:
+        print(f"  [!] Auto-unify skipped: {e}")
     entry["models"] = candidate
     save_db(db)
     n = generate_yaml(db)
@@ -1232,6 +1390,7 @@ def print_status(db, verbose=False):
             e = db.get(pid, {})
             print(f"  [C] {label + ' (custom)':<30} keys={len(e.get('keys', [])):<3} "
                   f"models={len(e.get('models', [])):<3} {' '.join(e.get('models', [])[:4])}")
+        _print_alias_summary(db)
         return
     print("\nConfigured:")
     any_cfg = False
@@ -1251,6 +1410,356 @@ def print_status(db, verbose=False):
             any_cfg = True
     if not any_cfg:
         print("  (none yet — use: add <name>, e.g. add gemini)")
+    _print_alias_summary(db)
+
+
+def _print_alias_summary(db):
+    aliases = _get_aliases(db)
+    if not aliases:
+        return
+    print("\n  Unified aliases (single gateway name -> multiple providers):")
+    for canonical, members in sorted(aliases.items()):
+        if not isinstance(members, list):
+            continue
+        # count valid vs stale
+        valid = []
+        stale = 0
+        for mem in members:
+            if not isinstance(mem, dict):
+                stale += 1
+                continue
+            pid = mem.get("provider")
+            m = mem.get("model")
+            pdata = db.get(pid, {}) if pid else {}
+            if pid and m and m in (pdata.get("models") or []):
+                label = pdata.get("label") or pid
+                valid.append(f"{label}:{m}")
+            else:
+                stale += 1
+        extra = f" +{stale} stale" if stale else ""
+        routes = 0
+        for mem in members:
+            pid = mem.get("provider") if isinstance(mem, dict) else None
+            pdata = db.get(pid, {}) if pid else {}
+            if pid and mem.get("model") in (pdata.get("models") or []):
+                routes += max(1, len(pdata.get("keys") or [])) if pdata else 0
+                # for local_ollama keys-less case, count 1
+                if db.get(pid, {}).get("keys") == [] and db.get(pid, {}).get("endpoints"):
+                    routes = max(routes, 1)
+        print(f"    {canonical:<30} <- {', '.join(valid) or '(empty)'}{extra}  [{len(valid)} sources, ~{routes} routes]")
+
+
+# ---------- unified alias (cross-provider single model_name) ----------
+
+def _all_model_refs(db):
+    """List of (pid, model, label) for every model currently in DB."""
+    out = []
+    for pid, pdata in db.items():
+        if pid == ALIAS_KEY or pid == "_unified":
+            continue
+        if not isinstance(pdata, dict):
+            continue
+        for m in pdata.get("models", []) or []:
+            label = pdata.get("label") or pid
+            out.append((pid, m, label))
+    return out
+
+
+def _alias_stem(m):
+    """Version/flash-safe stem: bare id stripped of provider prefix, free markers and date, never strips flash/pro/lite tier."""
+    s = (m or "").strip().lower().replace("_", "-").replace(" ", "-")
+    s = re.sub(r"-{2,}", "-", s)
+    bare = s.rsplit("/", 1)[-1].strip(".-_")
+    # Iterative strip: handles combos like -0731:free or -free-0731
+    while True:
+        orig = bare
+        if bare.endswith(":free"):
+            bare = bare[:-5]
+        elif bare.endswith("-free"):
+            bare = bare[:-5]
+        # date suffix -MMDD / -YYMMDD (digits only after dash, not .3 like 5.3)
+        if re.match(r".*-\d{3,4}$", bare) or re.match(r".*-\d{6,8}$", bare):
+            bare = re.sub(r"-\d{3,4}$", "", bare)
+            bare = re.sub(r"-\d{6,8}$", "", bare)
+        bare = re.sub(r"-{2,}", "-", bare).strip("-")
+        if bare == orig:
+            break
+    return bare
+
+
+def _suggest_alias_groups(db):
+    """Heuristic: group models whose stem matches (cross-provider). Returns {stem: [(pid,model),...]} with >=2 members."""
+    refs = _all_model_refs(db)
+    groups = {}
+    for pid, m, _ in refs:
+        stem = _alias_stem(m)
+        groups.setdefault(stem, []).append({"provider": pid, "model": m})
+    # also try without version digit? deepseek-v4-flash variants all share stem after date strip, already covered
+    out = {}
+    for stem, members in groups.items():
+        # keep only groups with >1 members and not all same pid+model
+        uniq = {(d["provider"], d["model"]) for d in members}
+        if len(uniq) >= 2:
+            # Prefer shorter canonical: stem itself or most common bare?
+            out[stem] = members
+    return out
+
+
+def _auto_unify_stems(db, current_pid, candidate_models):
+    """Silent auto-unify: every stem that appears in >=2 (provider,model) pairs becomes an alias.
+
+    Uses candidate_models as the future state for current_pid instead of db[current_pid]['models']
+    so newly added models are considered. Returns list of stems newly created/extended.
+    """
+    # Build combined view including the not-yet-saved candidate for current_pid
+    combined_refs = []
+    for pid, pdata in db.items():
+        if pid == ALIAS_KEY or pid == "_unified":
+            continue
+        if not isinstance(pdata, dict):
+            continue
+        models = pdata.get("models", []) or []
+        if pid == current_pid:
+            models = candidate_models
+        for m in models:
+            combined_refs.append((pid, m))
+    groups = {}
+    for pid, m in combined_refs:
+        stem = _alias_stem(m)
+        if not stem:
+            continue
+        groups.setdefault(stem, []).append({"provider": pid, "model": m})
+    aliases = _get_aliases(db)
+    # Ensure db has alias dict if we will create
+    changed = []
+    for stem, members in groups.items():
+        uniq = {}
+        for d in members:
+            uniq[(d["provider"], d["model"])] = d
+        members = list(uniq.values())
+        if len(members) < 2:
+            continue
+        # Validate not trivially same: must keep flash/pro distinction already via stem,
+        # but double-check stem not empty and canonical valid
+        if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]*$", stem):
+            continue
+        existing = aliases.get(stem)
+        if existing is None:
+            # New alias — create silently
+            db.setdefault(ALIAS_KEY, {})[stem] = members
+            changed.append(stem)
+            print(f"  [+] Auto-unified '{stem}' <- {', '.join(f'{d['provider']}:{d['model']}' for d in members)}")
+        else:
+            # Extend existing alias with any missing members (new provider/model added later)
+            existing_set = {(d.get("provider"), d.get("model")) for d in existing if isinstance(d, dict)}
+            missing = [d for d in members if (d["provider"], d["model"]) not in existing_set]
+            if missing:
+                # Validate each missing still actually exists in db (candidate already considered)
+                db[ALIAS_KEY][stem].extend(missing)
+                # dedup just in case
+                seen = {}
+                for d in db[ALIAS_KEY][stem]:
+                    if isinstance(d, dict) and d.get("provider") and d.get("model"):
+                        seen[(d["provider"], d["model"])] = d
+                db[ALIAS_KEY][stem] = list(seen.values())
+                changed.append(stem)
+                print(f"  [+] Auto-extended '{stem}' with {', '.join(f'{d['provider']}:{d['model']}' for d in missing)}")
+    return changed
+
+
+def _prompt_alias_canonical(default=""):
+    try:
+        raw = input(f"Canonical alias [{default}]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if not raw:
+        return default if default else None
+    if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9._:-]*$", raw):
+        print("  [!] Alias must start with alnum and contain only a-z 0-9 . _ : -")
+        return None
+    return raw
+
+
+def manage_aliases(db):
+    """Interactive alias manager loop: list/add/remove/suggest."""
+    while True:
+        aliases = _get_aliases(db)
+        print("\n--- Unified aliases ---")
+        if not aliases:
+            print("  (none yet — one gateway name can fan out to many providers to dodge rate limits)")
+        else:
+            for i, (canon, members) in enumerate(sorted(aliases.items()), 1):
+                valid = [f"{m.get('provider')}:{m.get('model')}" for m in (members or []) if isinstance(m, dict)]
+                print(f"  [{i}] {canon:<30} <- {' , '.join(valid) or '(empty)'}")
+        print("\n  [A]dd  [R]emove  [S]uggest  [Q] back")
+        print("  Hint: deepseek-v4-flash groups: free/deepseek-v4-flash-0731 (apinex),")
+        print("        deepseek/deepseek-v4-flash-free (orcarouter), deepseek-v4-flash:free (tokenharbor)")
+        try:
+            ch = input("Alias choice: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if ch in ("q", "quit", "back", "done", "exit", ""):
+            break
+        if ch in ("s", "suggest"):
+            sugg = _suggest_alias_groups(db)
+            if not sugg:
+                print("  [=] No cross-provider duplicates to suggest (stems all unique).")
+                continue
+            print("\n  Suggestions (same stem across providers):")
+            for stem, members in sorted(sugg.items()):
+                valid = [f"{m['provider']}:{m['model']}" for m in members]
+                canon = stem  # suggestion canonical
+                # for deepseek keep versioned name: deepseek-v4-flash
+                print(f"    {canon:<28} <- {' , '.join(valid)}")
+            try:
+                ans = input("  Apply a suggestion? Enter canonical to create (e.g. deepseek-v4-flash) or empty to cancel: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+            if not ans:
+                continue
+            # need to find members for ans stem
+            if ans not in sugg:
+                # allow user-typed canonical that is a stem variant: try stem lookup
+                stem = _alias_stem(ans)
+                members = sugg.get(stem)
+                if not members:
+                    print(f"  [!] No suggestion for '{ans}' (try Add manually).")
+                    continue
+            else:
+                members = sugg[ans]
+            # dedup and validate not already aliased
+            aliases = _get_aliases(db)
+            if ans in aliases:
+                print(f"  [!] Alias '{ans}' already exists — remove first or pick new name.")
+                continue
+            db.setdefault(ALIAS_KEY, {})[ans] = members
+            save_db(db)
+            n = generate_yaml(db)
+            print(f"  [+] Created '{ans}' with {len(members)} sources. Routes: {n}")
+            continue
+        if ch in ("a", "add"):
+            refs = _all_model_refs(db)
+            if not refs:
+                print("  [!] No models in DB yet.")
+                continue
+            print("\n  Available models (pick numbers to unify under one alias):")
+            for i, (pid, m, label) in enumerate(refs, 1):
+                print(f"    [{i:2d}] {label:<20} {m}")
+            print("  Enter numbers comma/space separated, e.g. 1,2,3  (empty cancels).")
+            try:
+                raw = input("  Pick: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+            if not raw:
+                continue
+            picked = []
+            for tok in raw.replace(",", " ").split():
+                if tok.isdigit() and 1 <= int(tok) <= len(refs):
+                    pid, m, _ = refs[int(tok) - 1]
+                    if {"provider": pid, "model": m} not in picked:
+                        picked.append({"provider": pid, "model": m})
+                else:
+                    print(f"  [!] #{tok} out of range")
+            if len(picked) < 2:
+                print("  [!] Need at least 2 models to unify.")
+                continue
+            # default canonical: stem of first, or shared stem
+            stems = [_alias_stem(d["model"]) for d in picked]
+            default = stems[0] if len(set(stems)) == 1 else "my-alias"
+            # Special-case deepseek trio: prefer deepseek-v4-flash
+            if all("deepseek" in d["model"].lower() for d in picked):
+                default = "deepseek-v4-flash"
+            canon = _prompt_alias_canonical(default)
+            if not canon:
+                print("  [-] Cancelled.")
+                continue
+            aliases = _get_aliases(db)
+            if canon in aliases:
+                print(f"  [!] Alias '{canon}' already exists.")
+                continue
+            # warn if canonical collides with bare alias
+            bare_aliases = set()
+            for pid, pdata in db.items():
+                if pid == ALIAS_KEY or pid == "_unified":
+                    continue
+                for m in pdata.get("models", []) or []:
+                    a = m.split("/")[-1] if "/" in m else m
+                    # custom_api bare handling matches generate_yaml
+                    bare_aliases.add(a)
+            if canon in bare_aliases:
+                print(f"  [i] '{canon}' already exists as a bare model alias — grouping will replace that single entry with the unified one.")
+            db.setdefault(ALIAS_KEY, {})[canon] = picked
+            save_db(db)
+            n = generate_yaml(db)
+            print(f"  [+] Unified '{canon}' <- {', '.join(f'{d['provider']}:{d['model']}' for d in picked)}  Routes: {n}")
+            continue
+        if ch in ("r", "remove", "rm", "delete", "del"):
+            aliases = _get_aliases(db)
+            if not aliases:
+                print("  (nothing to remove)")
+                continue
+            print("  Remove which? Enter number or canonical name.")
+            for i, canon in enumerate(sorted(aliases.keys()), 1):
+                print(f"    [{i}] {canon}")
+            try:
+                raw = input("  Pick #: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+            if not raw:
+                continue
+            target = None
+            if raw.isdigit() and 1 <= int(raw) <= len(aliases):
+                target = sorted(aliases.keys())[int(raw) - 1]
+            elif raw in aliases:
+                target = raw
+            if not target:
+                print(f"  [!] No alias '{raw}'")
+                continue
+            # offer member removal vs whole alias
+            members = aliases[target]
+            print(f"  Alias '{target}' has {len(members)} members:")
+            for i, mem in enumerate(members, 1):
+                print(f"    [{i}] {mem.get('provider')}:{mem.get('model')}")
+            print("  [A]ll (delete alias) or pick member numbers to remove, empty cancels.")
+            try:
+                raw2 = input("  Choice: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+            if not raw2:
+                continue
+            if raw2 in ("a", "all"):
+                del db[ALIAS_KEY][target]
+                if not db[ALIAS_KEY]:
+                    del db[ALIAS_KEY]
+                save_db(db)
+                n = generate_yaml(db)
+                print(f"  [-] Removed alias '{target}'. Routes: {n}")
+            else:
+                idxs = []
+                for tok in raw2.replace(",", " ").split():
+                    if tok.isdigit() and 1 <= int(tok) <= len(members):
+                        idxs.append(int(tok) - 1)
+                    else:
+                        print(f"  [!] #{tok} out of range")
+                if not idxs:
+                    continue
+                for idx in sorted(idxs, reverse=True):
+                    del db[ALIAS_KEY][target][idx]
+                if not db[ALIAS_KEY][target]:
+                    del db[ALIAS_KEY][target]
+                    if not db[ALIAS_KEY]:
+                        del db[ALIAS_KEY]
+                save_db(db)
+                n = generate_yaml(db)
+                print(f"  [-] Removed {len(idxs)} member(s) from '{target}'. Routes: {n}")
+            continue
+        print("  Unknown. Use A/R/S/Q.")
+    return
 
 
 PROVIDER_ALIASES = {
@@ -1449,7 +1958,7 @@ def main():
     show_all = False
     while True:
         print_status(db, verbose=show_all)
-        print("\n[#] number | add <name> (e.g. add google; bare add browses missing) | all | [T] proxy test | [Q] save+restart+quit")
+        print("\n[#] number | add <name> (e.g. add google; bare add browses missing) | alias (unify models) | all | [T] proxy test | [Q] save+restart+quit")
         try:
             ch = input("Choice: ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -1469,6 +1978,15 @@ def main():
             continue
         if low in ("all", "list", "ls"):
             show_all = not show_all
+            continue
+        if low in ("alias", "aliases", "group", "groups", "unify", "unified"):
+            manage_aliases(db)
+            db = load_db()
+            continue
+        if low.startswith("alias ") or low.startswith("group ") or low.startswith("unify "):
+            # shortcut: alias deepseek-v4-flash  -> jump straight into add flow
+            manage_aliases(db)
+            db = load_db()
             continue
         dyn = None  # dynamic custom-endpoint dict when resolved/created below
         if low == "add":

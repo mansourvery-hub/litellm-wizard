@@ -95,12 +95,29 @@ def load_aliases(litellm_config):
     db_path = os.path.join(LITELLM_DIR, "providers_db.json")
     with open(db_path) as f:
         db = json.load(f)
+    # Unified aliases: single gateway name -> many providers (evade rate limits)
+    aliases_map = db.get("_aliases") or db.get("_unified") or {}
+    seen, aliases = set(), []
+    # Unified first (keep declared order)
+    for canon in aliases_map:
+        if canon and canon not in seen:
+            seen.add(canon)
+            aliases.append(canon)
+    # Track covered (pid,model) so bare aliases don't double-show
+    covered = set()
+    for members in aliases_map.values():
+        if not isinstance(members, list):
+            continue
+        for mem in members:
+            if isinstance(mem, dict) and mem.get("provider") and mem.get("model"):
+                covered.add((mem["provider"], mem["model"]))
     pids = ["gemini", "openrouter", "ollama_cloud", "zai", "tokenrouter",
             "anthropic", "openai", "opencode_zen"]
     pids += sorted(k for k in db if k.startswith("custom_") and k not in pids)
-    seen, aliases = set(), []
     for pid in pids:
         for m in db.get(pid, {}).get("models", []):
+            if (pid, m) in covered:
+                continue
             # LiteLLM alias convention: last segment (matches model_name in config.yaml)
             a = m.split("/")[-1] if "/" in m else m
             if a not in seen:

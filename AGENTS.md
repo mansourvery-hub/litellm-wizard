@@ -37,6 +37,19 @@ Before completing changes, verify Python syntax:
 python3 -m py_compile wizard.py sync-opencode.py
 ```
 
+### Syncing the Installed Copy
+The live `litellm-add` command runs from `~/.config/litellm/wizard.py` — a copy of this repo's
+`wizard.py`. **At the end of every change to `wizard.py`, always copy it over** and keep the
+exec bit:
+
+```bash
+cp wizard.py ~/.config/litellm/wizard.py
+chmod +x ~/.config/litellm/wizard.py
+```
+
+Never run the wizard from the repo copy directly — it must match the installed version so
+`litellm-add` actually uses the fixed code.
+
 ---
 
 ## 3. Versioning & Conventions
