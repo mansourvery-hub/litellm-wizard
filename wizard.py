@@ -1,6 +1,6 @@
 #!/home/mohamed/.config/litellm/venv/bin/python
 """Single unified LiteLLM config wizard: keys -> validated -> models -> loop -> proxy test."""
-__version__ = "1.8.1"
+__version__ = "1.8.2"
 import json
 import os
 import re
@@ -77,6 +77,21 @@ def snippet(k):
 ALIAS_KEY = "_aliases"
 
 
+def _needs_drop_params(pid, m):
+    """Per-model drop_params: only for models known to reject tool_choice.
+
+    Global drop_params broke gemma4:31b agent tool-calling (raw JSON output),
+    so keep surgical. Currently only free/gpt-5.6-luna needs it.
+    """
+    bare = (m.split("/")[-1] if "/" in m else m).lower()
+    # strip free markers for comparison
+    if bare.endswith(":free"):
+        bare = bare[:-5]
+    if bare.endswith("-free"):
+        bare = bare[:-5]
+    return bare == "gpt-5.6-luna"
+
+
 def _get_aliases(db_data):
     """Return unified alias map {canonical: [{provider, model},...]} or {}."""
     a = db_data.get(ALIAS_KEY)
@@ -149,9 +164,12 @@ def generate_yaml(db_data):
                 else:
                     mid = m.split("/")[-1] if "/" in m else m
                 for k in keys:
+                    params = {"model": f"openai/{mid}", "api_base": base_url, "api_key": k}
+                    if _needs_drop_params(pid, m):
+                        params["drop_params"] = True
                     model_list.append({
                         "model_name": canonical,
-                        "litellm_params": {"model": f"openai/{mid}", "api_base": base_url, "api_key": k}
+                        "litellm_params": params
                     })
             elif p_type == "api":
                 full_model_path = f"{prefix}{m}" if not m.startswith(prefix) else m
@@ -159,6 +177,8 @@ def generate_yaml(db_data):
                     entry = {"model_name": canonical, "litellm_params": {"model": full_model_path, "api_key": k}}
                     if pid == "gemini":
                         entry["litellm_params"]["rpm"] = 15
+                    if _needs_drop_params(pid, m):
+                        entry["litellm_params"]["drop_params"] = True
                     model_list.append(entry)
 
     for provider_id, pdata in db_data.items():
@@ -223,13 +243,16 @@ def generate_yaml(db_data):
                     bare = m.split("/")[-1] if "/" in m else m
                     mid, alias = bare, bare
                 for k in keys:
+                    params = {
+                        "model": f"openai/{mid}",
+                        "api_base": base_url,
+                        "api_key": k
+                    }
+                    if _needs_drop_params(provider_id, m):
+                        params["drop_params"] = True
                     model_list.append({
                         "model_name": alias,
-                        "litellm_params": {
-                            "model": f"openai/{mid}",
-                            "api_base": base_url,
-                            "api_key": k
-                        }
+                        "litellm_params": params
                     })
 
         elif p_type == "api":
@@ -267,9 +290,6 @@ def generate_yaml(db_data):
                 "ServiceUnavailableErrorRetries": 3,
                 "DefaultRetries": 3
             }
-        },
-        "litellm_settings": {
-            "drop_params": True
         },
         "general_settings": {
             "master_key": MASTER_KEY
