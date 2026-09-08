@@ -1,6 +1,6 @@
 #!/home/mohamed/.config/litellm/venv/bin/python
 """Single unified LiteLLM config wizard: keys -> validated -> models -> loop -> proxy test."""
-__version__ = "1.8.0"
+__version__ = "1.8.1"
 import json
 import os
 import re
@@ -267,6 +267,9 @@ def generate_yaml(db_data):
                 "ServiceUnavailableErrorRetries": 3,
                 "DefaultRetries": 3
             }
+        },
+        "litellm_settings": {
+            "drop_params": True
         },
         "general_settings": {
             "master_key": MASTER_KEY
