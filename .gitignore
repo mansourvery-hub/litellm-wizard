@@ -1,6 +1,7 @@
 # NEVER commit real keys or configs — they contain secrets
 providers_db.json
 config.yaml
+.master_key
 *.bak*
 *.backup*
 venv/

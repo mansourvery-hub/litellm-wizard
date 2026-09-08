@@ -6,81 +6,121 @@ This document provides context, conventions, and operational workflows for AI co
 
 ## 1. Project Architecture & Structure
 
-`litellm-wizard` is a CLI setup and configuration manager for LiteLLM gateway (`localhost:4000`).
+`litellm-wizard` is a quota-aware, health-aware deployment manager for a local LiteLLM gateway (`localhost:4000`).
+Mental model: **wizard = control plane / config compiler, LiteLLM = runtime router.**
 
-- **`wizard.py`**: The interactive CLI wizard (Python 3.10+). Handles direct API key validation, live model catalog fetching, per-model completion pings, config generation (`config.yaml`), and database persistence (`providers_db.json`).
-- **`sync-opencode.py`**: Stdlib-only script that syncs LiteLLM gateway aliases into OpenCode's `opencode.json` configuration file as a `litellm` provider block.
-- **`litellm.service`**: Systemd user service definition running LiteLLM proxy on port 4000.
-- **`README.md`**: User-facing setup guide and jargon buster.
+- **`wizard.py`** (v2.x, Python 3.10+, PyYAML): interactive CLI. Direct key validation, live catalogs, minimal model probes, quota domains, capability pools, role aliases, `config.yaml` compilation, gateway/pool tests, readiness-aware restart, OpenCode sync offer.
+- **`sync-opencode.py`** (stdlib-only): syncs user-facing pools (+roles) into `opencode.json` as a `litellm` block. JSONC-tolerant, backup + atomic write, idempotent, `--dry-run`, never carries secrets.
+- **`tests/`**: stdlib `unittest` suite (fake keys only, mocked HTTP). Run with the venv python (system python lacks PyYAML).
+- **`litellm.service`**: systemd user service on port 4000.
+- **`README.md`**: user-facing guide + jargon buster.
+
+### Internal hierarchy
+
+```text
+Provider -> Quota domain -> Credential -> Deployment -> Logical pool -> Role -> LiteLLM YAML
+```
+
+Key distinctions: `key != quota`, `deployment != model`, `identity != capability`,
+`validation != health != quota`, `alias(pool) != role`.
+
+### Database (`providers_db.json`, schema v2, mode 0600)
+
+```json
+{
+  "_schema_version": 2,
+  "_settings": {"routing_preference": "balanced", "quota_split_mode": "per-deployment-split",
+                "validation_mode": "FAST", "sample_size": 2},
+  "_aliases": {"pool": [{"provider": "pid", "model": "mid"}]},
+  "_roles": {"fast": {"pools": [...], "fallback": [...], "requires": {}}},
+  "_quota_domains": {"google-project-a": {"rpm": 10, "tpm": null, "rpd": null,
+                      "confidence": "manual|provider_default|conservative|unknown"}},
+  "_health": {"pid:cred-id": {"status": "ok|throttled|invalid|unknown", ...}},
+  "<pid>": {"keys": [...], "credentials": [{"id": "cred-<hash>", "secret": "...",
+             "label": "", "quota_domain": "...", "enabled": true,
+             "validation": {"status": "...", ...}}],
+            "models": [...], "endpoints": [], "base_url": "...", "disabled": false}
+}
+```
+
+- `keys[]` is kept in sync for backward compat; `credentials[]` is the source of truth. Credential IDs are `cred-<sha256(secret)[:12]>` — stable across reorders, never the raw key.
+- `migrate_db()` is automatic + idempotent: legacy `_unified` -> `_aliases` (deduped), missing sections defaulted, one-credential-per-domain defaults. Never silently deletes valid config; `normalize_aliases()` cleans stale members visibly.
+- Quota semantics: Google = project-scoped (ask bulk grouping); others default to credential/account/unknown per `PROVIDER_META` (only verified facts; else `unknown`).
+
+### Compiler (`compile_config` -> `generate_yaml`)
+
+Stages: migrate/normalize -> credentials -> quota -> model metadata -> deployments
+-> pools -> roles -> routing/fallbacks -> YAML. Deterministic order
+(pool -> trust tier -> provider -> domain -> credential).
+
+- One deployment = one provider + credential + endpoint + model. Shared-domain RPM is split per (domain, model) — never N x quota.
+- Roles compile to `model_group_alias` (role -> first pool) + `fallbacks` (verified shapes for installed LiteLLM 1.100.0).
+- `router_settings` (verified vs installed LiteLLM): `usage-based-routing-v2`, `num_retries: 1`, `cooldown_time: 60`, `allowed_fails: 1`, `enable_pre_call_checks: true`, retry policy with ONLY supported keys (`Authentication/BadRequest/ContentPolicyViolation/RateLimit: 0`, `Timeout/InternalServer: 1`).
+- `general_settings.master_key` = `os.environ/LITELLM_MASTER_KEY` (env-backed; resolved via `get_master_key()`: env -> `~/.config/litellm/.master_key` (0600) -> generated). No hard-coded secrets.
+- Invariants enforced, failure leaves `config.yaml` untouched: no dup deployments, no stale members, no empty aliases/roles, no missing credentials, no empty endpoints, no pool/role name collisions.
 
 ---
 
 ## 2. Environment & Testing Guidelines
 
 ### Python Environment
-- Python executable for running the wizard locally: `~/.config/litellm/venv/bin/python`
-- System Python (`python3`) can run `sync-opencode.py` directly (stdlib only).
+- Wizard/tests: `~/.config/litellm/venv/bin/python` (has PyYAML + litellm).
+- `sync-opencode.py`: system `python3` is fine (stdlib only).
 
 ### Testing Code Changes Safely
-Never modify real user configs or databases during testing. Use environment variable overrides:
+Never modify real user configs. Always use env overrides:
 
 ```bash
 LITELLM_DB_FILE=/tmp/test_db.json \
 LITELLM_YAML_FILE=/tmp/test_config.yaml \
 OPENCODE_JSON=/tmp/test_opencode.json \
+LITELLM_SECRET_FILE=/tmp/test_master.key \
 ~/.config/litellm/venv/bin/python wizard.py
 ```
 
-### Syntax & Compilation Checks
-Before completing changes, verify Python syntax:
+### Checks (run all before finishing)
 ```bash
 python3 -m py_compile wizard.py sync-opencode.py
+~/.config/litellm/venv/bin/python -m unittest discover -s tests
+ruff check wizard.py sync-opencode.py tests/
 ```
 
+Only fake keys in tests; mock HTTP (`_get`/`_post`/`test_single_model`); never hit real providers from automated tests.
+
 ### Syncing the Installed Copy
-The live `litellm-add` command runs from `~/.config/litellm/wizard.py` — a copy of this repo's
-`wizard.py`. **At the end of every change to `wizard.py`, always copy it over** and keep the
-exec bit:
+Live `litellm-add` runs from `~/.config/litellm/wizard.py`. **After every `wizard.py` change:**
 
 ```bash
 cp wizard.py ~/.config/litellm/wizard.py
 chmod +x ~/.config/litellm/wizard.py
 ```
 
-Never run the wizard from the repo copy directly — it must match the installed version so
-`litellm-add` actually uses the fixed code.
-
 ---
 
 ## 3. Versioning & Conventions
 
-- Version banner `__version__` is maintained in `wizard.py`.
-- Increment `__version__` when introducing user-facing features or major bug fixes.
-- Keep `providers_db.json` and `config.yaml` out of git commits (`.gitignore`).
-- Preserve stdlib-first design principles for `sync-opencode.py` so it works without extra pip packages.
+- `__version__` in `wizard.py` (currently v2.x). Bump on user-facing features/major fixes.
+- Never commit `providers_db.json`, `config.yaml`, `.master_key`, `*.bak*` (see `.gitignore`).
+- `sync-opencode.py` stays stdlib-only. `wizard.py` stays dependency-light (stdlib + PyYAML).
+- Secrets: mask with `snippet()`/`_mask_secret()` (suffix only), never log headers/bodies wholesale, atomic writes (`_atomic_write_json/_text` + 0600) for DB/YAML/opencode.json, backup before replacing user-owned files.
+- Preserve fast UX: `add google` -> paste -> DONE -> pick -> DONE -> Q. Single-key flows ask no quota questions; bulk flows ask once.
+- Preserve: fuzzy `add <name>`, custom endpoints, free-first picker + `MORE`, keep-valid-keys flow, alias manager, dry-run sync, JSONC parsing, Zen-stays-native rule (never route OpenCode Zen session models via LiteLLM).
 
 ---
 
 ## 4. Git & GitHub (`gh`) Usage Workflows
 
 ### Authentication & Cloning
-- Use GitHub CLI (`gh`) for authentication and cloning on new environments:
-  ```bash
-  gh auth login
-  gh repo clone mansourvery-hub/litellm-wizard
-  ```
+```bash
+gh auth login
+gh repo clone mansourvery-hub/litellm-wizard
+```
 
 ### Commit Conventions
-- Keep commit messages concise, structured, and consistent with repo history.
-- Format: `Wizard vX.Y.Z: short description of changes` or `sync-opencode: short description`.
-- Examples:
-  - `Wizard v1.7.0: prevent short-alias hijacking; offer custom endpoint creation on unknown add`
-  - `sync-opencode: include custom_* providers; regex config parse`
+- Format: `Wizard vX.Y.Z: short description` or `sync-opencode: short description`.
 
 ### Inspection & Shipping Checklist
-Before committing and pushing (`shipping`):
-1. Run `git status` to verify modified and untracked files.
-2. Run `git diff` to inspect exact code modifications.
-3. Verify recent commit messages using `git log -n 5 --oneline`.
-4. Stage only intended files (`git add wizard.py README.md AGENTS.md`).
-5. Commit and push (`git commit -m "..." && git push origin main`).
+1. `git status` (only intended files; tests/ allowed; no secrets/backups).
+2. `git diff` (exact modifications).
+3. `git log -n 5 --oneline` (message style).
+4. Stage + commit + push (`git add wizard.py sync-opencode.py README.md AGENTS.md tests` as appropriate).
