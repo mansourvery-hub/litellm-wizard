@@ -5,15 +5,23 @@ Thin presentation layer only. All product logic (provider validation,
 quota math, config compilation, secret handling, OpenCode sync) lives in
 ``engine.py`` / ``wizard.py`` — this file must never implement any of it.
 
-Views (intentionally few): Home -> Configure -> Provider (-> ModelScreen)
--> Review(Done), plus Home -> Test. Quota/speed/routing/alias/service
-internals are NOT standalone screens; the grouping question and retired
-models surface inside the configure flow only.
+Views: Home (deployment table) -> Configure -> Provider (-> ModelScreen)
+-> Review(Done), plus Home -> Test and Home -> OpenCode view. Quota/speed/
+routing/alias/service internals are NOT standalone screens; the grouping
+question and retired models surface inside the configure flow only.
 
 Flow: paste keys -> background check -> resolve only genuine ambiguity
 (shared-limit question, retired models) -> pick models -> probe ->
 review -> apply (write + restart-if-changed + readiness) -> OpenCode sync.
 Network work always runs in background workers, never on the UI thread.
+
+Design notes (borrowed from free-coding-models, adapted):
+- Home is a dense sortable/filterable table: one row per deployment
+  (pool / provider / model / tier / rpm / tpm / quota / ctx / health).
+- Footer hints expose every single-key action; ``/`` filters, ``X``
+  clears, ``Space``/arrows move with a live detail card below the table.
+- A separate OpenCode view shows exactly what OpenCode sees: exposed
+  aliases grouped with their backing deployments (+ roles + sync state).
 """
 
 from __future__ import annotations
@@ -53,6 +61,7 @@ from textual.css.query import NoMatches
 from textual.screen import Screen
 from textual.widgets import (
     Button,
+    DataTable,
     Footer,
     Header,
     Input,
@@ -62,6 +71,7 @@ from textual.widgets import (
     SelectionList,
     Static,
     TextArea,
+    Tree,
 )
 from textual.widgets._selection_list import Selection
 
@@ -69,6 +79,207 @@ import engine
 
 STATUS_MARK = {"running": "[green]●[/]", "stopped": "[red]●[/]",
                "unknown": "[yellow]●[/]"}
+
+# Table columns for the Home dashboard (FCM-style dense table, one row
+# per deployment). Keys are sort/filter ids; labels get a ▲/▼ marker
+# for the active sort column at render time.
+TABLE_COLUMNS = (
+    ("pool", "Pool"),
+    ("provider", "Provider"),
+    ("upstream", "Model"),
+    ("tier", "Tier"),
+    ("rpm", "RPM"),
+    ("tpm", "TPM"),
+    ("quota", "Quota"),
+    ("ctx", "Ctx"),
+    ("health", "Health"),
+    ("key", "Key"),
+)
+SORT_KEYS = ("pool", "provider", "tier", "rpm", "health")
+
+HEALTH_DISPLAY = {
+    "healthy": ("✓", "healthy"),
+    "partially-throttled": ("~", "part-throttled"),
+    "throttled": ("~", "throttled"),
+    "invalid": ("✗", "invalid"),
+    "unknown": ("?", "unknown"),
+}
+HEALTH_RANK = {"healthy": 0, "partially-throttled": 1, "throttled": 2,
+               "unknown": 3, "invalid": 4}
+
+
+def _short_quota(qd: str, maxlen: int = 16) -> str:
+    """Compact quota-domain label for table cells (full id in detail)."""
+    short = (qd or "").removeprefix("project:").removeprefix("endpoint:")
+    if short.startswith("cred-") and len(short) > 13:
+        short = short[:13]  # cred-<8 hex> identifies the credential
+    elif short.startswith("credential:cred-"):
+        short = "cred-" + short.removeprefix("credential:cred-")[:8]
+    if len(short) > maxlen:
+        short = short[: maxlen - 1] + "…"
+    return short or "—"
+
+
+def deployment_table_rows(db: dict[str, Any]) -> list[dict[str, Any]]:
+    """One display row per compiled deployment (pure, no I/O, no secrets).
+
+    Everything shown comes straight from :func:`engine.compile_config`
+    (quota math + capabilities + health already resolved there); this only
+    formats suffix-masked, sort-ready cell values for the table.
+    """
+    _deps, pools, _roles, errors = engine.compile_config(db)
+    if errors:
+        return []
+    # Count deployments sharing one (domain, upstream model) so shared
+    # quota reads honestly (``10÷3`` = 10 RPM split across 3 deployments).
+    counts: dict[tuple[str, str], int] = {}
+    for pool_deps in pools.values():
+        for d in pool_deps:
+            key = (str(d.get("quota_domain") or ""), str(d.get("upstream_model") or ""))
+            counts[key] = counts.get(key, 0) + 1
+    quota_conf = {}
+    try:
+        quota_conf = db.get("_quota_domains") or {}
+    except AttributeError:
+        quota_conf = {}
+    rows: list[dict[str, Any]] = []
+    for pool in sorted(pools):
+        for d in sorted(pools[pool],
+                        key=lambda x: (str(x.get("provider") or ""),
+                                       str(x.get("credential_id") or ""))):
+            provider = str(d.get("provider") or "")
+            upstream = str(d.get("upstream_model") or "")
+            caps = d.get("capabilities") or {}
+            tier = str(caps.get("tier") or "unknown")
+            ctx = str(caps.get("context_window") or "unknown")
+            rpm, tpm = d.get("rpm"), d.get("tpm")
+            qd = str(d.get("quota_domain") or "")
+            n = counts.get((qd, upstream), 1)
+            if isinstance(rpm, (int, float)):
+                rpm_txt = f"{int(rpm)}÷{n}" if n > 1 else str(int(rpm))
+            else:
+                rpm_txt = "—"
+            tpm_txt = str(int(tpm)) if isinstance(tpm, (int, float)) else "—"
+            health = str(d.get("health") or "unknown")
+            mark, word = HEALTH_DISPLAY.get(health, ("?", health or "unknown"))
+            secret = d.get("secret") or ""
+            suffix = engine.mask_secret(secret) if secret else (
+                "local" if not d.get("credential_id") else "…" + str(d.get("credential_id"))[-4:])
+            try:
+                confidence = str((quota_conf.get(qd) or {}).get("confidence") or "")
+            except AttributeError:
+                confidence = ""
+            rows.append({
+                "pool": pool, "provider": provider, "upstream": upstream,
+                "tier": tier, "rpm": rpm, "tpm": tpm,
+                "rpm_txt": rpm_txt, "tpm_txt": tpm_txt,
+                "quota_domain": qd, "quota": _short_quota(qd),
+                "confidence": confidence, "shared": n,
+                "ctx": "—" if ctx in ("unknown", "None", "") else ctx,
+                "health": health, "health_txt": f"{mark} {word}",
+                "health_rank": HEALTH_RANK.get(health, 9),
+                "key": suffix,
+                "endpoint": str(d.get("endpoint") or "—"),
+            })
+    return rows
+
+
+def filter_table_rows(rows: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    """Case-insensitive substring filter over pool/provider/model/quota."""
+    q = (query or "").strip().lower()
+    if not q:
+        return list(rows)
+    return [r for r in rows
+            if q in r["pool"].lower() or q in r["provider"].lower()
+            or q in r["upstream"].lower() or q in r["quota_domain"].lower()]
+
+
+def sort_table_rows(rows: list[dict[str, Any]], sort_key: str,
+                    reverse: bool = False) -> list[dict[str, Any]]:
+    """Sort display rows (pure; never touches the DB)."""
+    key = sort_key if sort_key in SORT_KEYS else "pool"
+    def _k(r: dict[str, Any]):
+        if key == "rpm":
+            v = r.get("rpm")
+            return (-1 if v is None else int(v), r["pool"], r["provider"])
+        if key == "health":
+            return (r.get("health_rank", 9), r["pool"], r["provider"])
+        return (str(r.get(key) or "").lower(), r["pool"], r["provider"])
+    return sorted(rows, key=_k, reverse=reverse)
+
+
+def gateway_badge(overview: dict[str, Any], n_deps: int) -> str:
+    """One-line header badge: gateway state + pool/deployment counts."""
+    mark = STATUS_MARK.get(overview.get("gateway", "unknown"),
+                           STATUS_MARK["unknown"])
+    n_pools = len(overview.get("pools", []))
+    return (f"Gateway {mark} {status_word(str(overview.get('gateway', 'unknown')))}"
+            f"  •  {n_pools} pool(s)  •  {n_deps} deployment(s)")
+
+
+def row_detail_text(row: dict[str, Any] | None) -> str:
+    """FCM-style detail card for the highlighted row (full, untruncated)."""
+    if row is None:
+        return "↑↓ move • Enter opens details • / filter • s sort • o OpenCode view"
+    shared = ""
+    if row.get("shared", 1) > 1:
+        shared = (f"  (shared domain: {row['shared']} deployments "
+                  f"split this quota — never {row['shared']}×)")
+    conf = f" [{row['confidence']}]" if row.get("confidence") else ""
+    return (f"{row['pool']}  via {row['provider']} / {row['upstream']}\n"
+            f"tier {row['tier']} • ctx {row['ctx']} • "
+            f"rpm {row['rpm_txt']} • tpm {row['tpm_txt']} • "
+            f"quota {row['quota_domain'] or '—'}{conf}{shared}\n"
+            f"health {row['health_txt']} • key {row['key']} • "
+            f"endpoint {row['endpoint']}")
+
+
+def opencode_view_data(db: dict[str, Any], paths) -> dict[str, Any]:
+    """Facts for the 'what OpenCode sees' view (read-only, via engine).
+
+    ``exposed`` = aliases the gateway serves (from ``config.yaml`` — what
+    LiteLLM actually routes) plus roles; ``current`` = what opencode.json
+    has now (best effort); ``children`` = backing deployments per pool
+    from the compiler. Paths are honoured throughout, so temp-dir state
+    never leaks the live config.
+    """
+    _deps, pools, roles, errors = engine.compile_config(db)
+    aliases = engine.gateway_aliases(paths)
+    if aliases:
+        source = f"gateway config ({paths.yaml_file})"
+        exposed = list(aliases) + [r for r in roles if r not in aliases]
+    else:
+        source = "compiled pools (no gateway config yet — Apply first)"
+        exposed = sorted(pools) + [r for r in roles if r not in pools]
+    try:
+        differs = bool(engine.opencode_differs(paths))
+    except Exception:  # noqa: BLE001 -- unreadable counts as stale
+        differs = True
+    current: set[str] = set()
+    try:
+        import json as _json
+        with open(paths.opencode_json) as f:
+            cfg = _json.loads(engine._load_sync_module()._strip_jsonc(f.read()))
+        current = set(((cfg.get("provider") or {}).get("litellm") or {}).get("models") or {})
+    except Exception:  # noqa: BLE001 -- missing/unparseable file, shown as such
+        current = set()
+    children: dict[str, list[dict[str, str]]] = {}
+    for pool in sorted(pools):
+        kids = []
+        for d in pools[pool]:
+            secret = d.get("secret") or ""
+            kids.append({
+                "provider": str(d.get("provider") or ""),
+                "upstream": str(d.get("upstream_model") or ""),
+                "suffix": engine.mask_secret(secret) if secret else "local",
+                "rpm": str(int(d["rpm"])) if isinstance(d.get("rpm"), (int, float)) else "—",
+                "health": str(d.get("health") or "unknown"),
+            })
+        children[pool] = kids
+    return {"exposed": exposed, "current": sorted(current),
+            "pools": sorted(pools), "roles": dict(roles),
+            "children": children, "differs": differs, "source": source,
+            "errors": list(errors or [])}
 
 
 # ------------------------------------------------------- pure helpers ---
@@ -160,20 +371,46 @@ def done_lines(db: dict[str, Any]) -> str:
 # -------------------------------------------------------------- screens ---
 
 class HomeScreen(Screen):
+    """Dashboard table: one row per deployment (FCM-style, keyboard-first).
+
+    Keys: ``c`` configure, ``t`` test, ``v`` review, ``o`` OpenCode view,
+    ``/`` filter, ``s`` cycle sort, ``S`` reverse direction, ``x`` clear
+    filter, ``h`` hide invalid, ``q`` quit. Arrows/Enter navigate; the
+    detail card below always describes the highlighted row.
+    """
+
     BINDINGS = [  # noqa: RUF012 -- Textual API
         ("c", "configure", "Configure"), ("t", "test", "Test"),
-        ("v", "review", "Review"), ("q", "quit_app", "Quit")]
+        ("v", "review", "Review"), ("o", "opencode", "OpenCode"),
+        ("slash", "focus_filter", "Filter"),
+        ("s", "cycle_sort", "Sort"), ("S", "reverse_sort", "Reverse"),
+        ("x", "clear_filter", "Clear"), ("h", "toggle_hide", "Hide bad"),
+        ("q", "quit_app", "Quit")]
+
+    SORT_CYCLE = ("pool", "provider", "tier", "rpm", "health")
 
     def __init__(self) -> None:
         super().__init__()
         self.last_content = ""
+        self.rows: list[dict[str, Any]] = []
+        self.view_rows: list[dict[str, Any]] = []
+        self.sort_key = "pool"
+        self.sort_reverse = False
+        self.hide_invalid = False
+        self._built_columns = False
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical(id="body"):
             yield Label("LiteLLM Wizard", id="title")
-            yield Static("", id="home-content")
+            yield Static("", id="gateway-badge")
+            yield Input(placeholder="Filter pools/providers/models ( / to focus, x to clear )",
+                        id="home-filter")
+            yield DataTable(id="models-table", cursor_type="row")
+            yield Static("", id="row-detail")
+            yield Static("", id="home-attention")
             yield Button("Configure", id="go-configure", variant="primary")
+            yield Button("OpenCode view", id="go-opencode")
             yield Button("Test", id="go-test")
             yield Button("Review", id="go-review")
         yield Footer()
@@ -183,16 +420,124 @@ class HomeScreen(Screen):
         app = self.app
         assert isinstance(app, WizardApp)
         app.refresh_status_background()
+        # Keyboard-first like FCM: the table owns focus so single-key
+        # actions (c/t/v/o/s/...) fire immediately; / moves to the filter.
+        try:
+            self.query_one("#models-table", DataTable).focus()
+        except NoMatches:
+            pass
 
     def on_screen_resume(self) -> None:
         self.refresh_content()
+        try:
+            self.query_one("#models-table", DataTable).focus()
+        except NoMatches:
+            pass
+
+    # -- data --
 
     def refresh_content(self) -> None:
         app = self.app
         assert isinstance(app, WizardApp)
         overview = engine.gateway_overview(app.db, app.paths, status=app.status)
-        self.last_content = home_lines(overview)
-        self.query_one("#home-content", Static).update(self.last_content)
+        self.rows = deployment_table_rows(app.db)
+        badge = gateway_badge(overview, len(self.rows))
+        self._apply_view()
+        detail_row = self._highlighted_row() or (self.view_rows[0] if self.view_rows else None)
+        detail = row_detail_text(detail_row)
+        attention = overview.get("attention") or []
+        if not self.rows and not attention:
+            attention = ["No models configured yet — choose Configure to add keys."]
+        attn_txt = ("Needs attention\n" + "\n".join(f"  ! {a}" for a in attention)) if attention else ""
+        # Plain-text summary kept for tests / narrow terminals.
+        self.last_content = "\n".join(
+            [badge, "", *[r["pool"] for r in self.rows][:20],
+             *([f"! {a}" for a in attention] if attention else [])])
+        try:
+            self.query_one("#gateway-badge", Static).update(badge)
+            self.query_one("#row-detail", Static).update(detail)
+            self.query_one("#home-attention", Static).update(attn_txt)
+        except NoMatches:  # not yet mounted
+            pass
+
+    def _apply_view(self) -> None:
+        try:
+            filt = self.query_one("#home-filter", Input).value
+        except NoMatches:
+            filt = ""
+        rows = filter_table_rows(self.rows, filt)
+        if self.hide_invalid:
+            rows = [r for r in rows if r["health"] != "invalid"]
+        self.view_rows = sort_table_rows(rows, self.sort_key, self.sort_reverse)
+        self._rebuild_table()
+
+    def _rebuild_table(self) -> None:
+        try:
+            table = self.query_one("#models-table", DataTable)
+        except NoMatches:
+            return
+        table.clear(columns=True)
+        for key, label in TABLE_COLUMNS:
+            if key == self.sort_key:
+                label = f"{label} {'▲' if not self.sort_reverse else '▼'}"
+            table.add_column(label, key=key)
+        self._built_columns = True
+        if not self.view_rows:
+            return
+        for i, r in enumerate(self.view_rows):
+            table.add_row(r["pool"], r["provider"], r["upstream"], r["tier"],
+                          r["rpm_txt"], r["tpm_txt"], r["quota"], r["ctx"],
+                          r["health_txt"], r["key"], key=f"row-{i}")
+        try:
+            filt = self.query_one("#home-filter", Input).value.strip()
+        except NoMatches:
+            filt = ""
+        extra = [f"filter '{filt}'"] if filt else []
+        if self.hide_invalid:
+            extra.append("hiding invalid")
+        table.border_title = (f"{len(self.view_rows)}/{len(self.rows)} "
+                              f"sorted by {self.sort_key}"
+                              + (f" ({', '.join(extra)})" if extra else ""))
+
+    def _highlighted_row(self) -> dict[str, Any] | None:
+        try:
+            table = self.query_one("#models-table", DataTable)
+        except NoMatches:
+            return None
+        try:
+            idx = table.cursor_row
+        except Exception:  # noqa: BLE001 -- no cursor yet
+            return None
+        if idx is None or not (0 <= idx < len(self.view_rows)):
+            return None
+        return self.view_rows[idx]
+
+    def _update_detail(self) -> None:
+        try:
+            self.query_one("#row-detail", Static).update(
+                row_detail_text(self._highlighted_row()))
+        except NoMatches:
+            pass
+
+    # -- events --
+
+    @on(Input.Changed, "#home-filter")
+    def _filter_changed(self, _event: Input.Changed) -> None:
+        self._apply_view()
+        self._update_detail()
+
+    @on(Input.Submitted, "#home-filter")
+    def _filter_submitted(self, _event: Input.Submitted) -> None:
+        try:
+            self.query_one("#models-table", DataTable).focus()
+        except NoMatches:
+            pass
+
+    @on(DataTable.RowHighlighted)
+    def _row_highlighted(self, _event: DataTable.RowHighlighted) -> None:
+        self._update_detail()
+
+    # -- actions --
 
     def action_configure(self) -> None:
         self.app.push_screen(ConfigureScreen())
@@ -203,12 +548,48 @@ class HomeScreen(Screen):
     def action_review(self) -> None:
         self.app.push_screen(DoneScreen())
 
+    def action_opencode(self) -> None:
+        self.app.push_screen(OpenCodeScreen())
+
+    def action_focus_filter(self) -> None:
+        try:
+            self.query_one("#home-filter", Input).focus()
+        except NoMatches:
+            pass
+
+    def action_cycle_sort(self) -> None:
+        i = self.SORT_CYCLE.index(self.sort_key) if self.sort_key in self.SORT_CYCLE else -1
+        self.sort_key = self.SORT_CYCLE[(i + 1) % len(self.SORT_CYCLE)]
+        self._apply_view()
+
+    def action_reverse_sort(self) -> None:
+        self.sort_reverse = not self.sort_reverse
+        self._apply_view()
+
+    def action_clear_filter(self) -> None:
+        try:
+            inp = self.query_one("#home-filter", Input)
+            inp.value = ""
+            self.query_one("#models-table", DataTable).focus()
+        except NoMatches:
+            pass
+        self._apply_view()
+        self._update_detail()
+
+    def action_toggle_hide(self) -> None:
+        self.hide_invalid = not self.hide_invalid
+        self._apply_view()
+
     def action_quit_app(self) -> None:
         self.app.exit()
 
     @on(Button.Pressed, "#go-configure")
     def _go_configure(self) -> None:
         self.action_configure()
+
+    @on(Button.Pressed, "#go-opencode")
+    def _go_opencode(self) -> None:
+        self.action_opencode()
 
     @on(Button.Pressed, "#go-test")
     def _go_test(self) -> None:
@@ -1000,6 +1381,138 @@ class TestScreen(Screen):
         self.action_back()
 
 
+class OpenCodeScreen(Screen):
+    """What OpenCode sees: exposed aliases grouped with their children.
+
+    Read-only view over the gateway config + opencode.json (nothing is
+    written from here except the optional Sync button, which drives
+    :func:`engine.sync_opencode` like Review does). ``o`` on Home opens
+    it; ``Esc`` goes back; ``r`` refreshes.
+    """
+
+    BINDINGS = [("escape", "back", "Back"),  # noqa: RUF012 -- Textual API
+                ("r", "refresh", "Refresh"),
+                ("s", "sync", "Sync")]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_status = ""
+        self.data: dict[str, Any] | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with Vertical(id="body"):
+            yield Label("OpenCode view — what OpenCode sees", id="title")
+            yield Static("", id="opencode-status")
+            yield Tree("litellm", id="opencode-tree")
+            yield Button("Sync OpenCode", id="sync-opencode")
+            yield Button("Back", id="back")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.refresh_content()
+
+    def on_screen_resume(self) -> None:
+        self.refresh_content()
+
+    def refresh_content(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        self.data = opencode_view_data(app.db, app.paths)
+        exposed = self.data["exposed"]
+        stale = ("STALE — opencode.json differs from the gateway; "
+                 "press s to sync." if self.data["differs"]
+                 else "in sync with the gateway.")
+        if self.data["errors"]:
+            self.last_status = ("Configuration has problems: "
+                                + "; ".join(self.data["errors"][:3]))
+        elif not exposed:
+            self.last_status = "Nothing exposed yet — Configure, then Apply."
+        else:
+            self.last_status = (f"{len(exposed)} model(s) as litellm/<name> "
+                                f"({self.data['source']}) — {stale}")
+        try:
+            self.query_one("#opencode-status", Static).update(self.last_status)
+            self._rebuild_tree()
+        except NoMatches:  # not yet mounted
+            pass
+
+    def _rebuild_tree(self) -> None:
+        assert self.data is not None
+        tree = self.query_one("#opencode-tree", Tree)
+        tree.clear()
+        tree.root.label = (f"litellm — {len(self.data['exposed'])} model(s)"
+                           + (" (stale)" if self.data["differs"] else ""))
+        missing = set(self.data["exposed"]) - set(self.data["children"]) - set(self.data["roles"])
+        for alias in self.data["exposed"]:
+            kids = self.data["children"].get(alias, [])
+            if kids:
+                provs = ", ".join(sorted({k["provider"] for k in kids}))
+                node = tree.root.add_leaf(
+                    f"{alias}  ({len(kids)} backend(s): {provs})")
+                for k in kids:
+                    node.add_leaf(f"{k['provider']} / {k['upstream']} "
+                                  f"[{k['suffix']}] • rpm {k['rpm']} • {k['health']}")
+            elif alias in self.data["roles"]:
+                spec = self.data["roles"][alias]
+                prim = ", ".join(spec.get("pools") or [])
+                fb = ", ".join(spec.get("fallback") or [])
+                node = tree.root.add_leaf(f"{alias}  (role → {prim}"
+                                          + (f" | fallback {fb}" if fb else "") + ")")
+                for p in (spec.get("pools") or []) + (spec.get("fallback") or []):
+                    pkids = self.data["children"].get(p, [])
+                    if pkids:
+                        sub = node.add(f"{p} ({len(pkids)} backend(s))")
+                        for k in pkids:
+                            sub.add_leaf(f"{k['provider']} / {k['upstream']} "
+                                         f"[{k['suffix']}] • {k['health']}")
+                    else:
+                        node.add_leaf(f"{p} (no live backends)")
+            elif alias in missing:
+                tree.root.add_leaf(f"{alias}  (in opencode.json, no gateway backends)")
+        if self.data["current"]:
+            extra = [m for m in self.data["current"] if m not in self.data["exposed"]]
+            if extra:
+                node = tree.root.add_leaf(f"only in opencode.json ({len(extra)}):")
+                for m in sorted(extra)[:10]:
+                    node.add_leaf(m)
+        tree.root.expand_all()
+
+    def action_refresh(self) -> None:
+        self.refresh_content()
+
+    @on(Button.Pressed, "#sync-opencode")
+    def _sync(self) -> None:
+        self.action_sync()
+
+    def action_sync(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        try:
+            result = _quiet_call(engine.sync_opencode, app.paths)
+        except FileNotFoundError:
+            note = "OpenCode config not found — skipped."
+        except ValueError as e:
+            note = f"Sync failed ({e})."
+        else:
+            note = (f"OpenCode updated "
+                    f"({len(result.get('exposed', []))} model(s)). "
+                    f"Restart the OpenCode TUI, then /models.")
+        self.refresh_content()
+        self.last_status += f"\n{note}"
+        try:
+            self.query_one("#opencode-status", Static).update(self.last_status)
+        except NoMatches:
+            pass
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+    @on(Button.Pressed, "#back")
+    def _back(self) -> None:
+        self.action_back()
+
+
 class DoneScreen(Screen):
     """Review -> apply as one transaction -> optional OpenCode sync.
 
@@ -1185,9 +1698,15 @@ class WizardApp(App):
     TITLE = "LiteLLM Wizard"
     SUB_TITLE = f"v{engine.__version__}"
     CSS = """
-    #body { width: 72; height: auto; margin: 1 2; }
+    #body { width: 1fr; height: auto; margin: 1 2; }
     #title { text-style: bold; margin-bottom: 1; }
+    #gateway-badge { text-style: bold; margin-bottom: 1; }
     #home-content, #test-status, #test-results, #done-content { margin-bottom: 1; }
+    #home-attention, #opencode-status { margin: 1 0; }
+    #home-filter { margin-bottom: 1; }
+    #models-table { height: 14; margin-bottom: 1; }
+    #opencode-tree { height: 16; margin-bottom: 1; }
+    #row-detail { margin: 1 0; border: solid #444444; padding: 0 1; }
     #keys-input { height: 6; margin-bottom: 1; }
     #manual-input { height: 4; margin-bottom: 1; }
     #model-list { height: 12; margin-bottom: 1; }
