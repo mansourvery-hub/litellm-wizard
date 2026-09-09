@@ -95,6 +95,8 @@ class CredentialsTest(unittest.TestCase):
                    ("alpha-paid", "Paid")]
         ordered = engine.order_catalog_free_first(catalog)
         self.assertEqual(ordered[0][0], "free-thing:free")
+        self.assertTrue(engine.is_free_model("x:free"))
+        self.assertFalse(engine.is_free_model("pro-model-paid"))
         db = engine.load_state(engine.EnginePaths.temp(tempfile.mkdtemp()))
         self.assertEqual(engine.get_validation_mode(db), "FAST")
         self.assertEqual(engine.get_sample_size(db), 2)
@@ -186,6 +188,72 @@ class SyncTest(unittest.TestCase):
             on_disk = f.read()
         self.assertNotIn("GK1-FAKE", on_disk)
         self.assertTrue(any(n.startswith("opencode.json.bak-") for n in os.listdir(tmp)))
+
+
+class CombiningTest(unittest.TestCase):
+    def test_auto_combine_same_stem_flash(self):
+        db = engine.load_state(engine.EnginePaths.temp(tempfile.mkdtemp()))
+        engine.add_credentials(db, "gemini", ["GK1-FAKE"])
+        engine.add_credentials(db, "openrouter", ["OR1-FAKE"])
+        db["gemini"]["models"] = ["gemini-3.7-flash"]
+        db["openrouter"]["models"] = ["gemini-3.7-flash"]
+        created = engine.auto_combine(db, "openrouter", ["gemini-3.7-flash"])
+        self.assertIn("gemini-3.7-flash", created)
+        _deps, pools, _, errors = engine.compile_config(db)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(pools["gemini-3.7-flash"]), 2)
+
+    def test_pending_suggestions_only_uncertain(self):
+        db = engine.load_state(engine.EnginePaths.temp(tempfile.mkdtemp()))
+        engine.add_credentials(db, "openrouter", ["OR1-FAKE"])
+        engine.add_credentials(db, "zai", ["Z1-FAKE"])
+        db["openrouter"]["models"] = ["mimo-v2.5-free"]
+        db["zai"]["models"] = ["mimo-v2.5-free"]
+        # unknown tiers, same stem -> SUGGESTED, never silent
+        self.assertEqual(engine.auto_combine(db, "zai", ["mimo-v2.5-free"]), [])
+        pending = engine.pending_suggestions(db)
+        self.assertIn("mimo-v2.5", pending)
+        engine.combine_models(db, "mimo-v2.5",
+                              [(m["provider"], m["model"])
+                               for m in pending["mimo-v2.5"]])
+        self.assertNotIn("mimo-v2.5", engine.pending_suggestions(db))
+
+
+class GatewayProbeTest(unittest.TestCase):
+    def test_aliases_empty_without_config(self):
+        p, _ = tmp_paths()
+        self.assertEqual(engine.gateway_aliases(p), [])
+
+    def test_aliases_from_written_config(self):
+        p, _ = tmp_paths()
+        db = engine.load_state(p)
+        engine.add_credentials(db, "gemini", ["GK1-FAKE"])
+        db["gemini"]["models"] = ["gemini-3.7-flash"]
+        engine.write_config(db, p)
+        self.assertEqual(engine.gateway_aliases(p), ["gemini-3.7-flash"])
+
+    def test_probe_gateway_alias_mockable(self):
+        import wizard as w
+        p, _ = tmp_paths()
+        real = w._gateway_request
+        w._gateway_request = lambda *a, **k: ("OK", "choices OK")
+        try:
+            self.assertEqual(engine.probe_gateway_alias("m", p), ("OK", "choices OK"))
+        finally:
+            w._gateway_request = real
+
+    def test_quarantine_roundtrip(self):
+        db = engine.load_state(engine.EnginePaths.temp(tempfile.mkdtemp()))
+        ids = engine.add_credentials(db, "gemini", ["GK1-FAKE"])
+        engine.set_models(db, "gemini", ["gemini-3.7-flash"])
+        self.assertTrue(engine.set_credential_quarantined(db, "gemini", ids[0]))
+        deps, _, _, errors = engine.compile_config(db)
+        self.assertEqual(errors, [])
+        self.assertEqual(deps, [])  # parked: saved but excluded
+        self.assertTrue(engine.set_credential_quarantined(db, "gemini", ids[0], False))
+        deps, _, _, _ = engine.compile_config(db)
+        self.assertEqual(len(deps), 1)
+        self.assertFalse(engine.set_credential_quarantined(db, "gemini", "cred-nope"))
 
 
 if __name__ == "__main__":

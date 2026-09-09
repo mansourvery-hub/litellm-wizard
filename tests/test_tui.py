@@ -68,8 +68,7 @@ class HelpersTest(unittest.TestCase):
         db = seed_db(paths)
         self.assertIn("gemini-3.7-flash", test_lines(db))
         self.assertIn("1 connection(s)", done_lines(db))
-        self.assertIn("not tested yet", test_lines(db))
-        self.assertIn("Milestone 4", test_lines(db))
+        self.assertIn("Run the test", test_lines(db))
         self.assertIn("Apply writes safely", done_lines(db))
 
 
@@ -418,6 +417,162 @@ class ConfigureFlowTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.click("#apply")
                 await _wait_until(lambda: "not ready" in screen.last_status)
                 self.assertFalse(screen.applied_ok)
+
+
+class CombiningTest(unittest.IsolatedAsyncioTestCase):
+    """Milestone 4: automatic combining across providers + suggested pools."""
+
+    def setUp(self):
+        self._get, wizard._get = wizard._get, _no_network
+        self._post, wizard._post = wizard._post, _no_network
+        import urllib.request
+        self._urlopen = urllib.request.urlopen
+        urllib.request.urlopen = _no_network_urlopen
+
+    def tearDown(self):
+        wizard._get = self._get
+        wizard._post = self._post
+        import urllib.request
+        urllib.request.urlopen = self._urlopen
+
+    def make_app(self):
+        paths = temp_paths()
+        return WizardApp(paths=paths, status="unknown",
+                         status_auto_refresh=False), paths
+
+    async def test_two_providers_auto_combine(self):
+        app, paths = self.make_app()
+        db = engine.load_state(paths)
+        engine.add_credentials(db, "gemini", ["GK1-FAKE"])
+        engine.set_models(db, "gemini", ["gemini-3.7-flash"])
+        engine.save_state(db, paths)
+        app.db = engine.load_state(paths)
+        validated = ([("OR1-FAKE", True, "fine")], None)
+        catalog = [("gemini-3.7-flash", "Gemini Flash")]
+        probed = [("gemini-3.7-flash", "OK", "fine")]
+        with mock.patch.object(wizard, "validate_keys", return_value=validated), \
+                mock.patch.object(wizard, "fetch_catalog", return_value=catalog), \
+                mock.patch.object(wizard, "test_models", return_value=probed):
+            async with app.run_test(size=(100, 50)) as pilot:
+                await pilot.pause()
+                await _check_keys(pilot, app, "openrouter",
+                                  "OR1-FAKE", validated)
+                await pilot.click("#save-continue")
+                await _wait_until(lambda: isinstance(app.screen, ModelScreen))
+                model = app.screen
+                assert isinstance(model, ModelScreen)
+                await _wait_until(lambda: model.catalog_state == "ready")
+                model.query_one("#model-list", tui.SelectionList).select(
+                    "gemini-3.7-flash")
+                await pilot.click("#probe")
+                await _wait_until(lambda: model.catalog_state == "probed")
+                await pilot.click("#keep-passing")
+                await _wait_until(lambda: isinstance(app.screen, DoneScreen))
+                done = app.screen
+                assert isinstance(done, DoneScreen)
+                self.assertIn("multiple providers", done.last_status)
+                back = engine.load_state(paths)
+                members = back["_aliases"]["gemini-3.7-flash"]
+                self.assertEqual({m["provider"] for m in members},
+                                 {"gemini", "openrouter"})
+                _deps, pools, _, errors = engine.compile_config(back)
+                self.assertEqual(errors, [])
+                self.assertEqual(len(pools["gemini-3.7-flash"]), 2)
+
+    async def test_suggested_pool_grouped_on_review(self):
+        app, paths = self.make_app()
+        db = engine.load_state(paths)
+        engine.add_credentials(db, "openrouter", ["OR1-FAKE"])
+        engine.add_credentials(db, "zai", ["Z1-FAKE"])
+        engine.set_models(db, "openrouter", ["mimo-v2.5-free"])
+        engine.set_models(db, "zai", ["mimo-v2.5-free"])
+        engine.save_state(db, paths)
+        app.db = engine.load_state(paths)
+        async with app.run_test(size=(100, 50)) as pilot:
+            await pilot.pause()
+            app.push_screen(DoneScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, DoneScreen)
+            self.assertIn("mimo-v2.5", screen.last_content)
+            await pilot.click("#group-suggested")
+            await pilot.pause()
+            self.assertIn("Grouped mimo-v2.5", screen.last_status)
+            back = engine.load_state(paths)
+            self.assertIn("mimo-v2.5", back["_aliases"])
+            self.assertFalse(screen.applied_ok)
+
+
+class GatewayTestScreenTest(unittest.IsolatedAsyncioTestCase):
+    """Milestone 4: simple default test, diagnose, park failing connections."""
+
+    def setUp(self):
+        self._get, wizard._get = wizard._get, _no_network
+        self._post, wizard._post = wizard._post, _no_network
+        import urllib.request
+        self._urlopen = urllib.request.urlopen
+        urllib.request.urlopen = _no_network_urlopen
+
+    def tearDown(self):
+        wizard._get = self._get
+        wizard._post = self._post
+        import urllib.request
+        urllib.request.urlopen = self._urlopen
+
+    def make_seeded_app(self):
+        paths = temp_paths()
+        db = engine.load_state(paths)
+        engine.add_credentials(db, "gemini", ["GK1-FAKE"])
+        engine.set_models(db, "gemini", ["gemini-3.7-flash"])
+        engine.save_state(db, paths)
+        engine.write_config(db, paths)
+        app = WizardApp(paths=paths, status="unknown",
+                        status_auto_refresh=False)
+        app.db = engine.load_state(paths)
+        return app, paths
+
+    async def test_run_all_ok(self):
+        app, _ = self.make_seeded_app()
+        with mock.patch.object(engine, "probe_gateway_alias",
+                               return_value=("OK", "choices OK")):
+            async with app.run_test(size=(100, 50)) as pilot:
+                await pilot.pause()
+                app.push_screen(TestScreen())
+                await pilot.pause()
+                screen = app.screen
+                assert isinstance(screen, TestScreen)
+                await pilot.click("#run-test")
+                await _wait_until(lambda: screen.phase == "done")
+                self.assertIn("All models answer", screen.last_status)
+                self.assertIn("1 OK", screen.last_results)
+
+    async def test_run_failure_diagnose_park(self):
+        app, paths = self.make_seeded_app()
+        with mock.patch.object(engine, "probe_gateway_alias",
+                               return_value=("AUTH_ERROR", "HTTP 401: bad key")), \
+                mock.patch.object(engine, "probe_model",
+                                  return_value=("AUTH_ERROR", "bad key")):
+            async with app.run_test(size=(100, 50)) as pilot:
+                await pilot.pause()
+                app.push_screen(TestScreen())
+                await pilot.pause()
+                screen = app.screen
+                assert isinstance(screen, TestScreen)
+                await pilot.click("#run-test")
+                await _wait_until(lambda: screen.phase == "done")
+                self.assertIn("failing", screen.last_status)
+                await pilot.click("#diagnose")
+                await _wait_until(lambda: screen.phase == "diagnosed")
+                self.assertTrue(screen._parkable())
+                await pilot.click("#park-fixes")
+                await pilot.pause()
+                self.assertIn("Parked 1 connection", screen.last_status)
+                back = engine.load_state(paths)
+                creds = list(back["gemini"]["credentials"])
+                self.assertTrue(all(c.get("quarantined") for c in creds))
+                await pilot.click("#review")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, DoneScreen)
 
 
 if __name__ == "__main__":

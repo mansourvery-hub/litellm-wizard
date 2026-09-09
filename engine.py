@@ -459,6 +459,37 @@ def suggest_combinations(db: dict[str, Any]) -> dict[str, list[tuple[str, str]]]
     return _wiz._suggest_alias_groups(db)
 
 
+def auto_combine(db: dict[str, Any], pid: str,
+                 candidate: list[str]) -> list[str]:
+    """Silently create only AUTO stems (same call the CLI makes on save).
+
+    SUGGESTED (capability-uncertain) groups are never created here — they
+    are reported via :func:`pending_suggestions` for explicit user action.
+    Returns the created stem names. May print progress (callers quiet it).
+    """
+    return list(_wiz._auto_unify_stems(db, pid, list(candidate)) or [])
+
+
+def pending_suggestions(db: dict[str, Any]) -> dict[str, list[dict[str, str]]]:
+    """SUGGESTED same-model groups not yet realized as pools.
+
+    Stems already present in the alias map are skipped (the automatic path
+    extends those on save). MANUAL pairs never appear (the suggester omits
+    all-MANUAL groups), so applying these via :func:`combine_models` is safe.
+    """
+    aliases = _wiz._get_aliases(db)
+    out: dict[str, list[dict[str, str]]] = {}
+    for stem, spec in _wiz._suggest_alias_groups(db).items():
+        if not isinstance(spec, dict) or spec.get("mode") != "SUGGESTED":
+            continue
+        if stem in aliases:
+            continue
+        members = spec.get("members") or []
+        if len(members) >= 2:
+            out[stem] = list(members)
+    return out
+
+
 # ---------------------------------------------------------------- compiler ---
 
 def compile_config(db: dict[str, Any]):
@@ -562,6 +593,56 @@ def restart_gateway(runner: Callable | None = None,
 def wait_for_gateway(timeout_s: int = 60) -> bool:
     """Bounded readiness check (no fixed blind sleeps)."""
     return bool(_wiz.wait_for_proxy(timeout_s))
+
+
+def gateway_aliases(paths: EnginePaths | None = None) -> list[str]:
+    """Unique pool names the gateway config currently serves, in order.
+
+    Read from ``config.yaml`` (what LiteLLM actually serves), not from the
+    DB. Empty when no config has been applied yet.
+    """
+    import yaml as _yaml
+    p = _resolve_paths(paths)
+    try:
+        with open(p.yaml_file) as f:
+            cfg = _yaml.safe_load(f) or {}
+    except (OSError, ValueError):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in cfg.get("model_list", []) or []:
+        name = (item or {}).get("model_name")
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def probe_gateway_alias(alias: str, paths: EnginePaths | None = None,
+                        timeout: int = 25) -> tuple[str, str]:
+    """One minimal chat completion through the gateway for a single pool.
+
+    Returns ``(class, msg)`` with the CLI's classification (429 throttled
+    stays distinct from auth/server failures). Single-alias primitive so
+    the TUI can show progress and cancel between pools.
+    """
+    p = _resolve_paths(paths)
+    with _patched_wizard(p):
+        return _wiz._gateway_request(alias, _wiz.get_master_key(), timeout)
+
+
+def set_credential_quarantined(db: dict[str, Any], pid: str, cred_id: str,
+                               quarantined: bool = True) -> bool:
+    """Park/unpark one credential by ID. Parked credentials stay saved but
+    are excluded from compilation until applied. Returns True if found."""
+    entry = db.get(pid)
+    if not isinstance(entry, dict):
+        return False
+    for c in _wiz.iter_credentials(entry):
+        if c.get("id") == cred_id:
+            c["quarantined"] = bool(quarantined)
+            return True
+    return False
 
 
 def gateway_overview(db: dict[str, Any],

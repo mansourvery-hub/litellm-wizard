@@ -99,21 +99,19 @@ def home_lines(overview: dict[str, Any]) -> str:
 
 
 def test_lines(db: dict[str, Any]) -> str:
-    """Offline pool listing for the Test screen (no probing in M2)."""
+    """Idle listing for the Test screen (results render separately)."""
     _deps, pools, _roles, errors = engine.compile_config(db)
-    lines = ["Test your setup", ""]
     if errors:
-        lines.append("Configuration has problems:")
-        lines.extend(f"  ! {e}" for e in errors[:5])
-        return "\n".join(lines)
+        return "\n".join(["Test your setup", "",
+                           "Configuration has problems:",
+                           *[f"  ! {e}" for e in errors[:5]]])
     if not pools:
         return "Test your setup\n\nNothing to test yet — configure a provider first."
-    lines.append("Models")
+    lines = ["Test your setup", "", "Models"]
     for pool in sorted(pools):
         provs = sorted({d["provider"] for d in pools[pool]})
-        lines.append(f"  ? {pool}")
-        lines.append(f"    {', '.join(provs)} (not tested yet)")
-    lines += ["", "One-button testing arrives in Milestone 4."]
+        lines.append(f"  ? {pool}  ({', '.join(provs)})")
+    lines += ["", "Run the test to check every model through the gateway."]
     return "\n".join(lines)
 
 
@@ -700,9 +698,15 @@ class ModelScreen(Screen):
                    if c in ("OK", "RATE_LIMITED")]
         if not passing:
             return
+        created = _quiet_call(engine.auto_combine, app.db, self.pid, passing)
         engine.set_models(app.db, self.pid, passing)
         engine.save_state(app.db, app.paths)
-        app.push_screen(DoneScreen())
+        review = DoneScreen()
+        if created:
+            names = ", ".join(f"'{s}'" for s in created)
+            review.last_status = (f"✓ {names} now served from multiple "
+                                  "providers automatically.")
+        app.push_screen(review)
 
     @on(Button.Pressed, "#change-selection")
     def _change_selection(self) -> None:
@@ -728,31 +732,238 @@ class ModelScreen(Screen):
 
 
 class TestScreen(Screen):
+    """One-button gateway test with fix-up for failures.
+
+    Default test: one request per pool through the gateway (the product's
+    one job is a usable gateway). Failures can be diagnosed per underlying
+    connection; only wrong-key (auth) connections are offered for parking —
+    throttled or model-level failures need Configure attention, never an
+    automatic fix.
+    """
+
     BINDINGS = [("escape", "back", "Back")]  # noqa: RUF012 -- Textual API
+    PASS = ("OK", "RATE_LIMITED")
 
     def __init__(self) -> None:
         super().__init__()
-        self.last_content = ""
+        self.phase = "idle"  # idle | running | done | diagnosing | diagnosed
+        self.last_status = ""
+        self.last_results = ""
+        self.results: list[tuple[str, str, str]] = []
+        self.diag: list[tuple[str, str, str, str, str, str]] = []
+        self.parked = 0
+        self.parked_ids: set[tuple[str, str]] = set()
+        self._worker = None
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical(id="body"):
             yield Label("Test your setup", id="title")
-            yield Static("", id="test-content")
+            yield Static("", id="test-status")
+            yield Static("", id="test-results")
+            yield Button("Run test", id="run-test", variant="primary")
+            yield Button("Diagnose failures", id="diagnose")
+            yield Button("Park failing connections", id="park-fixes",
+                         variant="warning")
+            yield Button("Review & Apply", id="review", variant="primary")
+            yield Button("Cancel", id="cancel")
             yield Button("Back", id="back")
         yield Footer()
 
     def on_mount(self) -> None:
-        self.refresh_content()
-
-    def on_screen_resume(self) -> None:
-        self.refresh_content()
-
-    def refresh_content(self) -> None:
         app = self.app
         assert isinstance(app, WizardApp)
-        self.last_content = test_lines(app.db)
-        self.query_one("#test-content", Static).update(self.last_content)
+        self.last_status = test_lines(app.db)
+        self._show_state()
+
+    def on_screen_resume(self) -> None:
+        self._show_state()
+
+    # -- state --
+
+    def _failed_aliases(self) -> list[str]:
+        return [a for a, c, _ in self.results if c not in self.PASS]
+
+    def _parkable(self) -> list[tuple[str, str]]:
+        out = []
+        for _pool, pid, cid, _suf, cls, _msg in self.diag:
+            if (cls == "AUTH_ERROR" and cid and (pid, cid) not in out
+                    and (pid, cid) not in self.parked_ids):
+                out.append((pid, cid))
+        return out
+
+    def _visible_ids(self) -> list[str]:
+        if self.phase in ("running", "diagnosing"):
+            return ["cancel"]
+        if self.parked_ids:
+            return ["review", "run-test", "back"]
+        if self.phase == "diagnosed" and self._parkable():
+            return ["park-fixes", "run-test", "back"]
+        if self.phase == "done" and self._failed_aliases():
+            return ["diagnose", "run-test", "back"]
+        return ["run-test", "back"]
+
+    def _show_state(self) -> None:
+        try:
+            self.query_one("#test-status", Static).update(self.last_status)
+            self.query_one("#test-results", Static).update(self.last_results)
+            for bid in ("run-test", "diagnose", "park-fixes", "review",
+                        "cancel", "back"):
+                self.query_one(f"#{bid}", Button).display = bid in self._visible_ids()
+        except NoMatches:  # not yet mounted
+            return
+
+    def _render_results(self) -> None:
+        lines = []
+        for alias, cls, msg in self.results:
+            mark = {"OK": "✓", "RATE_LIMITED": "~"}.get(cls, "✗")
+            lines.append(f"  [{mark}] {alias}"
+                         + ("" if cls == "OK" else f" -> {msg[:110]}"))
+        counts: dict[str, int] = {}
+        for _, cls, _ in self.results:
+            counts[cls] = counts.get(cls, 0) + 1
+        n = len(self.results)
+        lines.append(f"\n{counts.get('OK', 0)} OK | "
+                     f"{counts.get('RATE_LIMITED', 0)} throttled | "
+                     f"{n - counts.get('OK', 0) - counts.get('RATE_LIMITED', 0)}"
+                     f" failed of {n}")
+        self.last_results = "\n".join(lines)
+        self._show_state()
+
+    # -- default test: one request per pool through the gateway --
+
+    @on(Button.Pressed, "#run-test")
+    def _run_test(self) -> None:
+        self.phase = "running"
+        self.results = []
+        self.diag = []
+        self.parked = 0
+        self.parked_ids = set()
+        self.last_results = ""
+        self._show_state()
+        self._worker = self.run_worker(self._run_task(), exclusive=True)
+
+    async def _run_task(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        aliases = await asyncio.to_thread(
+            _quiet_call, engine.gateway_aliases, app.paths)
+        if not aliases:
+            self.phase = "idle"
+            self.last_status = "Nothing to test yet — Apply first."
+            self._show_state()
+            return
+        for i, alias in enumerate(aliases):
+            self.last_status = f"Testing {i + 1}/{len(aliases)}: {alias}…"
+            self._show_state()
+            try:
+                cls, msg = await asyncio.to_thread(
+                    _quiet_call, engine.probe_gateway_alias, alias, app.paths)
+            except asyncio.CancelledError:
+                self.phase = "idle"
+                self.last_status = "Test cancelled."
+                self._show_state()
+                return
+            self.results.append((alias, cls, msg))
+            self._render_results()
+            if alias != aliases[-1]:
+                try:
+                    await asyncio.sleep(2.0)  # spacing mirrors the CLI smoke test
+                except asyncio.CancelledError:
+                    self.phase = "idle"
+                    self.last_status = "Test cancelled."
+                    self._show_state()
+                    return
+        failed = self._failed_aliases()
+        self.phase = "done"
+        if failed:
+            self.last_status = (f"{len(failed)} model(s) failing — diagnose to "
+                                "see which connection is at fault.")
+        else:
+            self.last_status = "All models answer through the gateway."
+        self._show_state()
+
+    # -- diagnose: probe each failing pool's connections directly --
+
+    @on(Button.Pressed, "#diagnose")
+    def _diagnose(self) -> None:
+        self.phase = "diagnosing"
+        self.diag = []
+        self.last_status = "Probing the failing connections directly…"
+        self._show_state()
+        self._worker = self.run_worker(self._diagnose_task(), exclusive=True)
+
+    async def _diagnose_task(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        deps, _pools, _roles, errors = engine.compile_config(app.db)
+        if errors:
+            self.phase = "done"
+            self.last_status = f"Cannot diagnose: {errors[0]}"
+            self._show_state()
+            return
+        failed = set(self._failed_aliases())
+        targets = [d for d in deps if d["logical_model"] in failed]
+        rows = []
+        for i, d in enumerate(targets):
+            secret = d.get("secret") if d.get("credential_id") else None
+            self.last_status = (f"Probing {i + 1}/{len(targets)}: "
+                                f"{d['logical_model']} via {d['provider']}…")
+            self._show_state()
+            try:
+                cls, msg = await asyncio.to_thread(
+                    _quiet_call, engine.probe_model,
+                    d["provider"], d["upstream_model"], secret, d.get("endpoint"))
+            except asyncio.CancelledError:
+                self.phase = "done"
+                self.last_status = "Diagnosis cancelled."
+                self._show_state()
+                return
+            suffix = engine.mask_secret(secret or "")
+            self.diag.append((d["logical_model"], d["provider"],
+                              d.get("credential_id") or "", suffix, cls, msg))
+            mark = {"OK": "✓", "RATE_LIMITED": "~"}.get(cls, "✗")
+            rows.append(f"  [{mark}] {d['logical_model']} via {d['provider']} "
+                        f"[{suffix}]" + ("" if cls == "OK" else f" -> {msg[:100]}"))
+            self.last_results = "\n".join(rows)
+            self._show_state()
+        parkable = self._parkable()
+        self.phase = "diagnosed"
+        if parkable:
+            self.last_status = (f"{len(parkable)} connection(s) reject their key "
+                                "(wrong/expired). Park them? Anything else "
+                                "needs Configure attention.")
+        else:
+            self.last_status = ("No wrong-key connections — failures are "
+                                "throttling or model-level. Give throttled "
+                                "pools a minute, or re-Configure the model.")
+        self._show_state()
+
+    @on(Button.Pressed, "#park-fixes")
+    def _park(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        n = 0
+        for pid, cid in self._parkable():
+            if engine.set_credential_quarantined(app.db, pid, cid, True):
+                self.parked_ids.add((pid, cid))
+                n += 1
+        if n:
+            engine.save_state(app.db, app.paths)
+        self.parked = n
+        self.last_status = (f"Parked {n} connection(s). They stay saved but "
+                            "leave the gateway on next Apply — Review & Apply "
+                            "to finish." if n else "Nothing to park.")
+        self._show_state()
+
+    @on(Button.Pressed, "#review")
+    def _review(self) -> None:
+        self.app.push_screen(DoneScreen())
+
+    @on(Button.Pressed, "#cancel")
+    def _cancel(self) -> None:
+        if self._worker is not None:
+            self._worker.cancel()
 
     def action_back(self) -> None:
         self.app.pop_screen()
@@ -778,6 +989,7 @@ class DoneScreen(Screen):
         self.last_content = ""
         self.last_status = ""
         self.applied_ok = False
+        self.suggestions: dict[str, list[dict[str, str]]] = {}
         self._worker = None
 
     def compose(self) -> ComposeResult:
@@ -787,6 +999,7 @@ class DoneScreen(Screen):
             yield Static("", id="done-content")
             yield Static("", id="apply-status")
             yield Button("Apply changes", id="apply", variant="primary")
+            yield Button("Group suggested models", id="group-suggested")
             yield Button("Sync OpenCode", id="sync")
             yield Button("Cancel", id="cancel")
             yield Button("Back to Home", id="back")
@@ -801,16 +1014,25 @@ class DoneScreen(Screen):
     def refresh_content(self) -> None:
         app = self.app
         assert isinstance(app, WizardApp)
+        self.suggestions = engine.pending_suggestions(app.db)
         self.last_content = done_lines(app.db)
+        if self.suggestions:
+            lines = ["", "Same model on several providers? Group only if",
+                     "they are truly interchangeable:"]
+            for stem, members in sorted(self.suggestions.items()):
+                provs = ", ".join(sorted({m["provider"] for m in members}))
+                lines.append(f"  ? {stem}  ({provs})")
+            self.last_content += "\n".join(lines)
         self.query_one("#done-content", Static).update(self.last_content)
         self.query_one("#apply-status", Static).update(self.last_status)
-        for bid in ("apply", "sync", "cancel", "back"):
+        for bid in ("apply", "group-suggested", "sync", "cancel", "back"):
             self.query_one(f"#{bid}", Button).display = bid in self._visible_ids()
 
     def _visible_ids(self) -> list[str]:
+        ids = ["group-suggested"] if self.suggestions else []
         if self.applied_ok:
-            return ["sync", "back"]
-        return ["apply", "back"]
+            return [*ids, "sync", "back"]
+        return ["apply", *ids, "back"]
 
     def _set_status(self, msg: str) -> None:
         self.last_status = msg
@@ -818,6 +1040,30 @@ class DoneScreen(Screen):
             self.query_one("#apply-status", Static).update(msg)
         except NoMatches:  # worker finished before mount; text kept in last_status
             pass
+
+    @on(Button.Pressed, "#group-suggested")
+    def _group_suggested(self) -> None:
+        app = self.app
+        assert isinstance(app, WizardApp)
+        grouped, skipped = [], []
+        for stem, members in sorted(self.suggestions.items()):
+            try:
+                engine.combine_models(db=app.db, canonical=stem,
+                                      members=[(m["provider"], m["model"])
+                                               for m in members])
+                grouped.append(stem)
+            except ValueError:
+                skipped.append(stem)
+        if grouped:
+            engine.save_state(app.db, app.paths)
+            self.applied_ok = False  # aliases changed -> apply again
+        note = ""
+        if grouped:
+            note = f"Grouped {', '.join(grouped)}. Review, then Apply again."
+        if skipped:
+            note += (" Could not group (incompatible): " + ", ".join(skipped) + ".")
+        self._set_status((note or "Nothing grouped.").strip())
+        self.refresh_content()
 
     @on(Button.Pressed, "#apply")
     def _apply(self) -> None:
@@ -913,13 +1159,12 @@ class WizardApp(App):
     CSS = """
     #body { width: 72; height: auto; margin: 1 2; }
     #title { text-style: bold; margin-bottom: 1; }
-    #home-content, #test-content, #done-content { margin-bottom: 1; }
+    #home-content, #test-status, #test-results, #done-content { margin-bottom: 1; }
     #keys-input { height: 6; margin-bottom: 1; }
     #manual-input { height: 4; margin-bottom: 1; }
     #model-list { height: 12; margin-bottom: 1; }
     #endpoint-input, #filter { margin-bottom: 1; }
-    #phase-status, #check-results, #model-status, #apply-status { margin: 1 0; }
-    Button { margin-bottom: 1; }
+    #phase-status, #check-results, #model-status, #apply-status { margin: 1 0; }    Button { margin-bottom: 1; }
     """
 
     def __init__(self, paths: engine.EnginePaths | None = None,
