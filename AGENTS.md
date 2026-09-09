@@ -10,6 +10,8 @@ This document provides context, conventions, and operational workflows for AI co
 Mental model: **wizard = control plane / config compiler, LiteLLM = runtime router.**
 
 - **`wizard.py`** (v2.x, Python 3.10+, PyYAML): interactive CLI. Direct key validation, live catalogs, minimal model probes, quota domains, capability pools, role aliases, `config.yaml` compilation, gateway/pool tests, readiness-aware restart, OpenCode sync offer.
+- **`engine.py`** (stdlib + PyYAML via `wizard`): clean callable facade over `wizard.py`/`sync-opencode.py`. No reimplemented logic. The TUI (and future callers) drive the product through it; network/systemd adapters are mockable, paths overridable.
+- **`tui.py`** (Textual): thin presentation layer — Home/Configure/Provider/Test/Review screens only. Must never contain provider logic, quota math, compilation, secret handling, or OpenCode mutation.
 - **`sync-opencode.py`** (stdlib-only): syncs user-facing pools (+roles) into `opencode.json` as a `litellm` block. JSONC-tolerant, backup + atomic write, idempotent, `--dry-run`, never carries secrets.
 - **`tests/`**: stdlib `unittest` suite (fake keys only, mocked HTTP). Run with the venv python (system python lacks PyYAML).
 - **`litellm.service`**: systemd user service on port 4000.
@@ -80,9 +82,9 @@ LITELLM_SECRET_FILE=/tmp/test_master.key \
 
 ### Checks (run all before finishing)
 ```bash
-python3 -m py_compile wizard.py sync-opencode.py
+python3 -m py_compile wizard.py sync-opencode.py engine.py tui.py
 ~/.config/litellm/venv/bin/python -m unittest discover -s tests
-ruff check wizard.py sync-opencode.py tests/
+ruff check wizard.py sync-opencode.py engine.py tui.py tests/
 ```
 
 Only fake keys in tests; mock HTTP (`_get`/`_post`/`test_single_model`); never hit real providers from automated tests.
