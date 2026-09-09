@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Textual TUI for litellm-wizard.
 
 Thin presentation layer only. All product logic (provider validation,
@@ -20,7 +21,30 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import os
+import sys
 from typing import Any
+
+try:
+    import textual  # noqa: F401
+    import yaml  # noqa: F401
+except ImportError:
+    # Re-exec with a venv python that has the dependencies (same trick as
+    # wizard.py): prefer a venv next to this file, else the standard one.
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _candidates = [
+        os.path.join(_here, "venv", "bin", "python"),
+        os.path.join(os.path.expanduser("~"), ".config", "litellm",
+                     "venv", "bin", "python"),
+    ]
+    for _venv_py in _candidates:
+        if (os.path.exists(_venv_py)
+                and os.path.abspath(sys.executable) != os.path.abspath(_venv_py)):
+            os.execv(_venv_py, [_venv_py, os.path.abspath(__file__)] + sys.argv[1:])
+    print("[!] Missing dependencies. Run with the project venv, e.g.:")
+    print("    ~/.config/litellm/venv/bin/python tui.py")
+    print("    (or: pip install -r requirements.txt)")
+    sys.exit(1)
 
 from textual import on
 from textual.app import App, ComposeResult
@@ -138,7 +162,7 @@ def done_lines(db: dict[str, Any]) -> str:
 class HomeScreen(Screen):
     BINDINGS = [  # noqa: RUF012 -- Textual API
         ("c", "configure", "Configure"), ("t", "test", "Test"),
-        ("v", "review", "Review")]
+        ("v", "review", "Review"), ("q", "quit_app", "Quit")]
 
     def __init__(self) -> None:
         super().__init__()
@@ -178,6 +202,9 @@ class HomeScreen(Screen):
 
     def action_review(self) -> None:
         self.app.push_screen(DoneScreen())
+
+    def action_quit_app(self) -> None:
+        self.app.exit()
 
     @on(Button.Pressed, "#go-configure")
     def _go_configure(self) -> None:
@@ -1156,6 +1183,7 @@ class DoneScreen(Screen):
 
 class WizardApp(App):
     TITLE = "LiteLLM Wizard"
+    SUB_TITLE = f"v{engine.__version__}"
     CSS = """
     #body { width: 72; height: auto; margin: 1 2; }
     #title { text-style: bold; margin-bottom: 1; }
@@ -1194,9 +1222,46 @@ class WizardApp(App):
                 screen.refresh_content()
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
+    """Entry point. ``--version`` / ``--check`` are non-interactive."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    if "--version" in args or "-v" in args:
+        print(engine.__version__)
+        return 0
+    if "--check" in args:
+        return startup_check()
     WizardApp().run()
+    return 0
+
+
+def startup_check() -> int:
+    """Verify the install without touching the screen: imports, paths, DB."""
+    import textual as _textual
+    print(f"wizard {engine.__version__} / textual {_textual.__version__}")
+    try:
+        paths = engine.EnginePaths.from_env()
+    except Exception as e:  # noqa: BLE001 -- report, don't crash
+        print(f"[FAIL] cannot resolve paths: {e}")
+        return 1
+    print(f"db: {paths.db_file}")
+    try:
+        db = engine.load_state(paths)
+    except Exception as e:  # noqa: BLE001 -- report, don't crash
+        print(f"[FAIL] cannot read DB: {e}")
+        return 1
+    providers = [pid for pid, pdata in db.items()
+                 if not pid.startswith("_") and isinstance(pdata, dict)
+                 and (pdata.get("keys") or pdata.get("models"))]
+    print(f"providers configured: {len(providers)}"
+          + (f" ({', '.join(sorted(providers))})" if providers else ""))
+    _deps, pools, _roles, errors = engine.compile_config(db)
+    if errors:
+        print(f"[WARN] config would not compile: {errors[0]}")
+    else:
+        print(f"pools compile: {len(pools)}")
+    print("OK")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

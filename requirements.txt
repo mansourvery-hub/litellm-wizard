@@ -1,0 +1,8 @@
+# Verified dependency set for litellm-wizard (see README install steps).
+# litellm is pinned: the compiler's router/retry shapes are verified
+# against this exact release. textual is pinned: the TUI is tested
+# against this release.
+litellm==1.100.0
+textual==8.2.8
+PyYAML==6.0.3
+requests==2.34.2

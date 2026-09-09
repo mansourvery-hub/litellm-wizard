@@ -75,12 +75,15 @@ cp ~/litellm-wizard/litellm.service ~/.config/systemd/user/litellm.service
 # Make sure the wizard is runnable directly (cp doesn't always keep the exec bit):
 chmod +x ~/.config/litellm/wizard.py
 
-# 4) Isolated Python box + install LiteLLM inside it (takes a few minutes)
+# 4) Isolated Python box + install inside it (takes a few minutes)
 python3 -m venv ~/.config/litellm/venv
-~/.config/litellm/venv/bin/pip install -U pip litellm pyyaml requests
+~/.config/litellm/venv/bin/pip install -U pip litellm pyyaml requests textual
+# Equivalent, from a clone of this repo (pins the verified versions):
+# ~/.config/litellm/venv/bin/pip install -r ~/litellm-wizard/requirements.txt
 
-# 5) Shortcut so you can launch the wizard by typing one word
+# 5) Shortcuts so you can launch things by typing one word
 echo "alias litellm-add='~/.config/litellm/venv/bin/python ~/.config/litellm/wizard.py'" >> ~/.zshrc
+echo "alias litellm-tui='~/.config/litellm/venv/bin/python ~/litellm-wizard/tui.py'" >> ~/.zshrc
 source ~/.zshrc
 ```
 
@@ -116,13 +119,31 @@ systemctl --user status litellm.service --no-pager | head -n 8
 
 `enable` = start on every login. If it ever crashes, systemd restarts it after 3 seconds.
 
-## 5. Add your providers with the wizard (the easy part)
+## 5. Add your providers (the easy part)
+
+The primary interface is the terminal app:
 
 ```bash
-litellm-add
+litellm-tui
 ```
 
-What happens, step by step:
+Home shows whether the gateway works, your models, and anything needing
+attention. **Configure** walks you through one provider at a time: paste
+keys → they are checked in the background → answer at most one question
+(do your keys share one usage limit?) → pick models from the live list
+(free first, type to filter) → each pick is probe-tested → **Review**
+shows what Apply will do. Same-model pools across providers are grouped
+automatically; uncertain ones are offered for one-confirm grouping.
+**Test** checks every model through the gateway and helps park wrong-key
+connections. **Apply** writes safely, restarts only if anything changed,
+and offers the OpenCode sync.
+
+Keyboard: arrows/enter navigate lists, `c`/`t`/`v` jump on Home,
+`q` quits from Home, `Esc` goes back. No network call ever blocks the UI.
+Sanity check without the UI: `litellm-tui --check`.
+
+The classic CLI (`litellm-add`) still works unchanged and shares the same
+database — use either. What happens in the CLI, step by step:
 
 1. You see only what you've already configured (empty at first). Type `add google`
    (names are fuzzy: `google`, `openrouter`, `claude`, `gpt`, `zen`, `zai`, `glm`…).
@@ -372,7 +393,9 @@ with `quota` afterwards).
 
 | Situation | Command |
 |---|---|
-| Add/remove keys or models | `litellm-add` (Q applies + restarts; re-sync OpenCode if pools changed) |
+| Add/remove keys or models | `litellm-tui` (Configure → Review → Apply; re-sync OpenCode if pools changed) |
+| Same, classic CLI | `litellm-add` (Q applies + restarts; re-sync OpenCode if pools changed) |
+| Quick self-check, no UI | `litellm-tui --check` |
 | Is it running? | `systemctl --user status litellm.service --no-pager` |
 | What broke? | `journalctl --user -u litellm.service -n 50 --no-pager` |
 | Quick self-check | `litellm-add` → `diagnose` |
@@ -387,6 +410,9 @@ with `quota` afterwards).
 | File | What | Secrets? |
 |---|---|---|
 | `wizard.py` | Control plane: validation, catalogs, probes, quota/compiler, YAML gen | No |
+| `engine.py` | Clean callable API over the wizard (used by the TUI; no logic of its own) | No |
+| `tui.py` | Terminal app: Home/Configure/Test/Review screens (needs `textual`) | No |
+| `requirements.txt` | Pinned, verified dependency set (`litellm`, `textual`, `pyyaml`, `requests`) | No |
 | `sync-opencode.py` | Writes gateway pools (+roles) into `opencode.json` (backup + `--dry-run`) | No |
 | `tests/` | Automated suite (`python -m unittest discover -s tests`, venv python) | No (fake keys only) |
 | `litellm.service` | systemd unit that runs the gateway on port 4000 | No |

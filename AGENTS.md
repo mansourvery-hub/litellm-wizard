@@ -84,6 +84,7 @@ LITELLM_SECRET_FILE=/tmp/test_master.key \
 ```bash
 python3 -m py_compile wizard.py sync-opencode.py engine.py tui.py
 ~/.config/litellm/venv/bin/python -m unittest discover -s tests
+~/.config/litellm/venv/bin/python -m pytest tests/   # same suite, pytest runner
 ruff check wizard.py sync-opencode.py engine.py tui.py tests/
 ```
 

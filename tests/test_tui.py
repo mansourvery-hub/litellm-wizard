@@ -25,7 +25,6 @@ from tui import (
     done_lines,
     home_lines,
     split_keys,
-    test_lines,
 )
 
 
@@ -66,9 +65,9 @@ class HelpersTest(unittest.TestCase):
     def test_test_and_done_lines(self):
         paths = temp_paths()
         db = seed_db(paths)
-        self.assertIn("gemini-3.7-flash", test_lines(db))
+        self.assertIn("gemini-3.7-flash", tui.test_lines(db))
         self.assertIn("1 connection(s)", done_lines(db))
-        self.assertIn("Run the test", test_lines(db))
+        self.assertIn("Run the test", tui.test_lines(db))
         self.assertIn("Apply writes safely", done_lines(db))
 
 
@@ -573,6 +572,39 @@ class GatewayTestScreenTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.click("#review")
                 await pilot.pause()
                 self.assertIsInstance(app.screen, DoneScreen)
+
+
+class StartupTest(unittest.TestCase):
+    """Milestone 5: non-interactive entry points, temp env only."""
+
+    def test_version(self):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(tui.main(["--version"]), 0)
+        self.assertEqual(buf.getvalue().strip(), engine.__version__)
+
+    def test_check_ok(self):
+        import io
+        import os
+        from contextlib import redirect_stdout
+        from unittest import mock
+        paths = temp_paths()
+        env = {"LITELLM_DB_FILE": paths.db_file,
+               "LITELLM_YAML_FILE": paths.yaml_file,
+               "LITELLM_SECRET_FILE": paths.secret_file,
+               "OPENCODE_JSON": paths.opencode_json}
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, env), redirect_stdout(buf):
+            self.assertEqual(tui.main(["--check"]), 0)
+        out = buf.getvalue()
+        self.assertIn("providers configured: 0", out)
+        self.assertIn("OK", out)
+
+    def test_home_has_quit_binding(self):
+        bindings = {b[1]: b[0] for b in HomeScreen.BINDINGS}
+        self.assertEqual(bindings.get("quit_app"), "q")
 
 
 if __name__ == "__main__":
