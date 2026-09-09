@@ -298,12 +298,13 @@ def calculate_quota_domains(db: dict[str, Any],
 
 
 def set_quota_domains(db: dict[str, Any], pid: str, mode: str) -> str:
-    """Resolve bulk grouping with ONE decision: ``shared`` or ``separate``.
+    """Resolve bulk grouping with ONE decision: ``shared`` / ``separate`` / ``later``.
 
     ``shared`` puts every credential of ``pid`` in one domain;
-    ``separate`` gives each credential its own domain. Returns the
-    resulting domain id (shared) or ``separate``. Mirrors the CLI's
-    ``quota_grouping_prompt`` outcome without prompting.
+    ``separate`` gives each credential its own domain; ``later`` keeps the
+    automatic defaults. All modes mark the provider reviewed (mirroring the
+    CLI's ``quota_grouping_prompt``: the question is never nagged twice).
+    Returns the resulting domain id, ``separate``, or ``later``.
     """
     entry = db.get(pid)
     if not isinstance(entry, dict):
@@ -315,10 +316,16 @@ def set_quota_domains(db: dict[str, Any], pid: str, mode: str) -> str:
                                  source="tui grouping answer")
         for c in creds:
             c["quota_domain"] = qd
+        entry["quota_reviewed"] = True
         _wiz.migrate_db(db)
         return qd
+    if mode == "later":
+        entry["quota_reviewed"] = True
+        _wiz.migrate_db(db)
+        return "later"
     for c in creds:
         c["quota_domain"] = _wiz.default_quota_domain_id(pid, c)
+    entry["quota_reviewed"] = True
     _wiz.migrate_db(db)
     return "separate"
 
@@ -331,6 +338,68 @@ def calculate_capacity(db: dict[str, Any], members) -> dict[str, Any]:
 def needs_grouping_question(db: dict[str, Any], pid: str) -> bool:
     """True when bulk keys for a project-scoped provider are ambiguous."""
     return bool(_wiz.needs_quota_hint(db, pid))
+
+
+def get_validation_mode(db: dict[str, Any]) -> str:
+    """FAST / STRICT / SAMPLE probe mode from settings (default FAST)."""
+    mode = (db.get(_wiz.SETTINGS_KEY) or {}).get("validation_mode", "FAST")
+    return mode if mode in ("FAST", "STRICT", "SAMPLE") else "FAST"
+
+
+def get_sample_size(db: dict[str, Any]) -> int:
+    """Per-model probe sample size from settings (default 2)."""
+    try:
+        return max(1, int((db.get(_wiz.SETTINGS_KEY) or {}).get("sample_size", 2)))
+    except (TypeError, ValueError):
+        return 2
+
+
+def get_models(db: dict[str, Any], pid: str) -> list[str]:
+    """Configured model IDs for a provider (may be empty)."""
+    entry = db.get(pid)
+    if not isinstance(entry, dict):
+        return []
+    return [m for m in entry.get("models", []) if isinstance(m, str)]
+
+
+def set_models(db: dict[str, Any], pid: str, models: list[str]) -> list[str]:
+    """Replace a provider's model list (deduped, order preserved)."""
+    entry = db.get(pid)
+    if not isinstance(entry, dict):
+        entry = {"keys": [], "models": [], "endpoints": []}
+        db[pid] = entry
+    seen: set[str] = set()
+    clean = []
+    for m in models:
+        if isinstance(m, str) and m and m not in seen:
+            seen.add(m)
+            clean.append(m)
+    entry["models"] = clean
+    return clean
+
+
+def mark_catalog_checked(db: dict[str, Any], pid: str) -> None:
+    """Stamp a successful live-catalog fetch (mirrors the CLI)."""
+    import datetime as _dt
+    entry = db.get(pid)
+    if isinstance(entry, dict):
+        entry["catalog_checked_at"] = _dt.datetime.now().isoformat(  # noqa: DTZ005 -- mirrors wizard.py's naive stamp format
+            timespec="seconds")
+        entry["catalog_source"] = "live provider catalog"
+
+
+def order_catalog_free_first(
+        catalog: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Catalog sorted free/cheap/useful first (same predicate as the CLI)."""
+    def _key(item: tuple[str, str]) -> tuple[int, str]:
+        mid, label = item if len(item) == 2 else (item[0], "")
+        return (0 if _wiz._is_free_model(mid, label) else 1, str(mid).lower())
+    return sorted(catalog, key=_key)
+
+
+def is_free_model(mid: str, label: str = "") -> bool:
+    """Free/cheap/useful predicate (same rule the CLI picker uses)."""
+    return bool(_wiz._is_free_model(mid, label))
 
 
 # ------------------------------------------------------------------ models ---

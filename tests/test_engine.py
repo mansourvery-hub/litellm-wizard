@@ -73,6 +73,34 @@ class CredentialsTest(unittest.TestCase):
                                       "endpoints": []}})
         self.assertFalse(engine.needs_grouping_question(db, "gemini"))
 
+    def test_grouping_multi_key_asks_then_reviewed(self):
+        db = engine.load_state(engine.EnginePaths.temp(tempfile.mkdtemp()))
+        engine.add_credentials(db, "gemini", ["K1-FAKE", "K2-FAKE"])
+        self.assertTrue(engine.needs_grouping_question(db, "gemini"))
+        self.assertEqual(engine.set_quota_domains(db, "gemini", "later"), "later")
+        self.assertFalse(engine.needs_grouping_question(db, "gemini"))
+        self.assertTrue(db["gemini"]["quota_reviewed"])
+
+    def test_models_get_set_and_catalog_stamp(self):
+        db = engine.load_state(engine.EnginePaths.temp(tempfile.mkdtemp()))
+        self.assertEqual(engine.get_models(db, "gemini"), [])
+        self.assertEqual(engine.set_models(db, "gemini", ["b", "a", "b", ""]),
+                         ["b", "a"])
+        self.assertEqual(engine.get_models(db, "gemini"), ["b", "a"])
+        engine.mark_catalog_checked(db, "gemini")
+        self.assertEqual(db["gemini"]["catalog_source"], "live provider catalog")
+
+    def test_free_first_ordering_and_modes(self):
+        catalog = [("pro-model-paid", "Paid"), ("free-thing:free", "Free"),
+                   ("alpha-paid", "Paid")]
+        ordered = engine.order_catalog_free_first(catalog)
+        self.assertEqual(ordered[0][0], "free-thing:free")
+        db = engine.load_state(engine.EnginePaths.temp(tempfile.mkdtemp()))
+        self.assertEqual(engine.get_validation_mode(db), "FAST")
+        self.assertEqual(engine.get_sample_size(db), 2)
+        db["_settings"]["validation_mode"] = "BOGUS"
+        self.assertEqual(engine.get_validation_mode(db), "FAST")
+
 
 class CompilerTest(unittest.TestCase):
     def test_compile_and_write_and_overview(self):

@@ -1,11 +1,15 @@
-"""TUI shell tests (Milestone 2). Temp dirs + fake keys only, no network.
+"""TUI tests (Milestones 2-3). Temp dirs + fake keys only.
 
 Network guard: wizard HTTP adapters and urlopen raise if touched — any
-screen that performs I/O beyond local files fails loudly.
+unmocked network access fails loudly. Milestone 3 flow tests mock at the
+``wizard.validate_keys`` / ``wizard.fetch_catalog`` / ``wizard.test_models``
+level so the engine delegation path is genuinely exercised.
 """
 import asyncio
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 import engine
 import tui
@@ -14,6 +18,7 @@ from tui import (
     ConfigureScreen,
     DoneScreen,
     HomeScreen,
+    ModelScreen,
     ProviderScreen,
     TestScreen,
     WizardApp,
@@ -64,8 +69,8 @@ class HelpersTest(unittest.TestCase):
         self.assertIn("gemini-3.7-flash", test_lines(db))
         self.assertIn("1 connection(s)", done_lines(db))
         self.assertIn("not tested yet", test_lines(db))
-        self.assertIn("Milestone", test_lines(db))
-        self.assertIn("Milestone", done_lines(db))
+        self.assertIn("Milestone 4", test_lines(db))
+        self.assertIn("Apply writes safely", done_lines(db))
 
 
 class TuiPilotTest(unittest.IsolatedAsyncioTestCase):
@@ -91,7 +96,7 @@ class TuiPilotTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_launch_shows_home(self):
         app = self.make_app()
-        async with app.run_test() as pilot:
+        async with app.run_test(size=(100, 50)) as pilot:
             await pilot.pause()
             self.assertIsInstance(app.screen, HomeScreen)
             assert isinstance(app.screen, HomeScreen)
@@ -99,7 +104,7 @@ class TuiPilotTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_all_views_reachable(self):
         app = self.make_app()
-        async with app.run_test() as pilot:
+        async with app.run_test(size=(100, 50)) as pilot:
             await pilot.pause()
             await pilot.press("c")
             await pilot.pause()
@@ -130,23 +135,27 @@ class TuiPilotTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertIsInstance(app.screen, HomeScreen)
 
-    async def test_save_keys_offline(self):
+    async def test_check_and_save_keys(self):
         paths = temp_paths()
         app = WizardApp(paths=paths, status="unknown", status_auto_refresh=False)
-        async with app.run_test() as pilot:
-            await pilot.pause()
-            app.push_screen(ProviderScreen("openrouter"))
-            await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, ProviderScreen)
-            screen.query_one("#keys-input", tui.TextArea).load_text(
-                "OR1-FAKE, OR2-FAKE")
-            await pilot.click("#save-keys")
-            await pilot.pause()
-            self.assertIn("Saved 2 key(s)", screen.last_result)
-            # persisted + readable by the engine/CLI path
-            back = engine.load_state(paths)
-            self.assertEqual(len(back["openrouter"]["keys"]), 2)
+        validated = ([("OR1-FAKE", True, "fine"), ("OR2-FAKE", True, "fine")], None)
+        with mock.patch.object(wizard, "validate_keys", return_value=validated):
+            async with app.run_test(size=(100, 50)) as pilot:
+                await pilot.pause()
+                app.push_screen(ProviderScreen("openrouter"))
+                await pilot.pause()
+                screen = app.screen
+                assert isinstance(screen, ProviderScreen)
+                screen.query_one("#keys-input", tui.TextArea).load_text(
+                    "OR1-FAKE, OR2-FAKE")
+                await pilot.click("#check")
+                await _wait_until(lambda: screen.phase == "results")
+                self.assertIn("All 2 connection(s) work", screen.last_result)
+                await pilot.click("#save-continue")
+                await _wait_until(lambda: isinstance(app.screen, ModelScreen))
+                # persisted + readable by the engine/CLI path
+                back = engine.load_state(paths)
+                self.assertEqual(len(back["openrouter"]["keys"]), 2)
 
     async def test_background_refresh_applies(self):
         paths = temp_paths()
@@ -155,7 +164,7 @@ class TuiPilotTest(unittest.IsolatedAsyncioTestCase):
         engine.gateway_status = lambda *a, **k: calls.append(1) or "running"
         try:
             app = WizardApp(paths=paths)  # status unknown, bg refresh on
-            async with app.run_test() as pilot:
+            async with app.run_test(size=(100, 50)) as pilot:
                 await pilot.pause()
                 for _ in range(200):
                     if app.status == "running":
@@ -173,6 +182,242 @@ def _no_network(*a, **k):
 
 def _no_network_urlopen(*a, **k):
     raise AssertionError("network call attempted from TUI shell")
+
+
+async def _wait_until(pred, timeout=15):
+    start = time.monotonic()
+    while not pred():
+        if time.monotonic() - start > timeout:
+            raise AssertionError("timed out waiting for UI state")
+        await asyncio.sleep(0.05)
+
+
+FREE_CATALOG = [("free-a:free", "Free A"), ("paid-b", "Paid B")]
+
+
+async def _check_keys(pilot, app, pid, text, validate):
+    """Drive ProviderScreen check; returns the screen in results phase."""
+    app.push_screen(ProviderScreen(pid))
+    await pilot.pause()
+    screen = app.screen
+    assert isinstance(screen, ProviderScreen)
+    screen.query_one("#keys-input", tui.TextArea).load_text(text)
+    with mock.patch.object(wizard, "validate_keys", return_value=validate):
+        await pilot.click("#check")
+        await _wait_until(lambda: screen.phase == "results")
+    return screen
+
+
+class ConfigureFlowTest(unittest.IsolatedAsyncioTestCase):
+    """Milestone 3: provider -> check -> grouping -> models -> probe -> apply."""
+
+    def setUp(self):
+        self._get, wizard._get = wizard._get, _no_network
+        self._post, wizard._post = wizard._post, _no_network
+        import urllib.request
+        self._urlopen = urllib.request.urlopen
+        urllib.request.urlopen = _no_network_urlopen
+
+    def tearDown(self):
+        wizard._get = self._get
+        wizard._post = self._post
+        import urllib.request
+        urllib.request.urlopen = self._urlopen
+
+    def make_app(self):
+        paths = temp_paths()
+        return WizardApp(paths=paths, status="unknown",
+                         status_auto_refresh=False), paths
+
+    async def test_single_key_skips_grouping(self):
+        app, _ = self.make_app()
+        validated = ([("K1-FAKE", True, "fine")], None)
+        async with app.run_test(size=(100, 50)) as pilot:
+            await pilot.pause()
+            screen = await _check_keys(pilot, app, "gemini", "K1-FAKE", validated)
+            await pilot.click("#save-continue")
+            await _wait_until(lambda: isinstance(app.screen, ModelScreen))
+            self.assertEqual(screen.results, [("K1-FAKE", True, "fine")])
+
+    async def test_two_keys_grouping_question(self):
+        app, paths = self.make_app()
+        validated = ([("K1-FAKE", True, "fine"), ("K2-FAKE", True, "fine")], None)
+        async with app.run_test(size=(100, 50)) as pilot:
+            await pilot.pause()
+            screen = await _check_keys(pilot, app, "gemini",
+                                       "K1-FAKE K2-FAKE", validated)
+            await pilot.click("#save-continue")
+            await _wait_until(lambda: screen.phase == "grouping")
+            await pilot.click("#share")
+            await _wait_until(lambda: isinstance(app.screen, ModelScreen))
+            db = engine.load_state(paths)
+            creds = list(db["gemini"]["credentials"])
+            self.assertEqual({c["quota_domain"] for c in creds},
+                             {"project:gemini-shared"})
+            self.assertTrue(db["gemini"]["quota_reviewed"])
+
+    async def test_partial_failure_keeps_valid_only(self):
+        app, paths = self.make_app()
+        validated = ([("K1-FAKE", True, "fine"),
+                      ("K2-FAKE", False, "bad key")], None)
+        async with app.run_test(size=(100, 50)) as pilot:
+            await pilot.pause()
+            screen = await _check_keys(pilot, app, "openrouter",
+                                       "K1-FAKE K2-FAKE", validated)
+            self.assertIn("1 of 2 work", screen.last_result)
+            await pilot.click("#save-continue")
+            await _wait_until(lambda: isinstance(app.screen, ModelScreen))
+            model_screen = app.screen
+            assert isinstance(model_screen, ModelScreen)
+            self.assertEqual(model_screen.secrets, ["K1-FAKE"])
+            back = engine.load_state(paths)
+            self.assertEqual(back["openrouter"]["keys"], ["K1-FAKE"])
+
+    async def test_select_probe_save_review(self):
+        app, paths = self.make_app()
+        validated = ([("K1-FAKE", True, "fine")], None)
+        probed = [("paid-b", "OK", "fine")]
+        with mock.patch.object(wizard, "fetch_catalog", return_value=FREE_CATALOG), \
+                mock.patch.object(wizard, "test_models", return_value=probed):
+            async with app.run_test(size=(100, 50)) as pilot:
+                await pilot.pause()
+                await _check_keys(pilot, app, "openrouter", "K1-FAKE", validated)
+                await pilot.click("#save-continue")
+                await _wait_until(lambda: isinstance(app.screen, ModelScreen))
+                screen = app.screen
+                assert isinstance(screen, ModelScreen)
+                await _wait_until(lambda: screen.catalog_state == "ready")
+                # free-first: only the free model shown until toggled
+                mlist = screen.query_one("#model-list", tui.SelectionList)
+                self.assertEqual(mlist.option_count, 1)
+                await pilot.click("#show-toggle")
+                await pilot.pause()
+                self.assertEqual(mlist.option_count, 2)
+                # filter narrows
+                screen.query_one("#filter", tui.Input).value = "paid"
+                await pilot.pause()
+                self.assertEqual(mlist.option_count, 1)
+                screen.query_one("#filter", tui.Input).value = ""
+                await pilot.pause()
+                mlist.select("paid-b")
+                await pilot.click("#probe")
+                await _wait_until(lambda: screen.catalog_state == "probed")
+                self.assertIn("[OK] paid-b", screen.last_status)
+                await pilot.click("#keep-passing")
+                await _wait_until(lambda: isinstance(app.screen, DoneScreen))
+                back = engine.load_state(paths)
+                self.assertEqual(back["openrouter"]["models"], ["paid-b"])
+
+    async def test_probe_blocks_failures(self):
+        app, paths = self.make_app()
+        validated = ([("K1-FAKE", True, "fine")], None)
+        probed = [("free-a:free", "OK", "fine"),
+                  ("paid-b", "AUTH_ERROR", "bad key")]
+        with mock.patch.object(wizard, "fetch_catalog", return_value=FREE_CATALOG), \
+                mock.patch.object(wizard, "test_models", return_value=probed):
+            async with app.run_test(size=(100, 50)) as pilot:
+                await pilot.pause()
+                await _check_keys(pilot, app, "openrouter", "K1-FAKE", validated)
+                await pilot.click("#save-continue")
+                await _wait_until(lambda: isinstance(app.screen, ModelScreen))
+                screen = app.screen
+                assert isinstance(screen, ModelScreen)
+                await _wait_until(lambda: screen.catalog_state == "ready")
+                await pilot.click("#show-toggle")
+                await pilot.pause()
+                mlist = screen.query_one("#model-list", tui.SelectionList)
+                mlist.select("free-a:free")
+                mlist.select("paid-b")
+                await pilot.click("#probe")
+                await _wait_until(lambda: screen.catalog_state == "probed")
+                self.assertIn("[FAIL] paid-b", screen.last_status)
+                await pilot.click("#keep-passing")
+                await _wait_until(lambda: isinstance(app.screen, DoneScreen))
+                back = engine.load_state(paths)
+                self.assertEqual(back["openrouter"]["models"], ["free-a:free"])
+
+    async def test_manual_models_fallback(self):
+        app, paths = self.make_app()
+        validated = ([("K1-FAKE", True, "fine")], None)
+        probed = [("custom-m1", "OK", "fine")]
+        with mock.patch.object(wizard, "fetch_catalog", return_value=None), \
+                mock.patch.object(wizard, "test_models", return_value=probed):
+            async with app.run_test(size=(100, 50)) as pilot:
+                await pilot.pause()
+                await _check_keys(pilot, app, "openrouter", "K1-FAKE", validated)
+                await pilot.click("#save-continue")
+                await _wait_until(lambda: isinstance(app.screen, ModelScreen))
+                screen = app.screen
+                assert isinstance(screen, ModelScreen)
+                await _wait_until(lambda: screen.catalog_state == "failed")
+                screen.query_one("#manual-input", tui.TextArea).load_text(
+                    "custom-m1")
+                await pilot.click("#manual-use")
+                await _wait_until(lambda: screen.catalog_state == "probed")
+                await pilot.click("#keep-passing")
+                await _wait_until(lambda: isinstance(app.screen, DoneScreen))
+                back = engine.load_state(paths)
+                self.assertEqual(back["openrouter"]["models"], ["custom-m1"])
+
+    async def test_retired_models_noticed(self):
+        app, _ = self.make_app()
+        db = engine.load_state(app.paths)
+        engine.add_credentials(db, "openrouter", ["K1-FAKE"])
+        engine.set_models(db, "openrouter", ["old-retired"])
+        engine.save_state(db, app.paths)
+        app.db = engine.load_state(app.paths)
+        validated = ([("K1-FAKE", True, "fine")], None)
+        with mock.patch.object(wizard, "fetch_catalog", return_value=FREE_CATALOG):
+            async with app.run_test(size=(100, 50)) as pilot:
+                await pilot.pause()
+                await _check_keys(pilot, app, "openrouter", "K1-FAKE", validated)
+                await pilot.click("#save-continue")
+                await _wait_until(lambda: isinstance(app.screen, ModelScreen))
+                screen = app.screen
+                assert isinstance(screen, ModelScreen)
+                await _wait_until(lambda: screen.catalog_state == "ready")
+                self.assertIn("old-retired", screen.last_status)
+
+    async def test_apply_success_then_sync_offer(self):
+        app, paths = self.make_app()
+        db = engine.load_state(paths)
+        engine.add_credentials(db, "gemini", ["GK1-FAKE"])
+        engine.set_models(db, "gemini", ["gemini-3.7-flash"])
+        engine.save_state(db, paths)
+        app.db = engine.load_state(paths)
+        with mock.patch.object(engine, "restart_gateway", return_value=True):
+            async with app.run_test(size=(100, 50)) as pilot:
+                await pilot.pause()
+                app.push_screen(DoneScreen())
+                await pilot.pause()
+                screen = app.screen
+                assert isinstance(screen, DoneScreen)
+                await pilot.click("#apply")
+                await _wait_until(lambda: screen.applied_ok)
+                self.assertIn("Gateway working", screen.last_status)
+                self.assertIn("out of sync", screen.last_status)
+                # OpenCode file absent: sync failure reported separately
+                await pilot.click("#sync")
+                await pilot.pause()
+                self.assertIn("gateway itself is working", screen.last_status)
+
+    async def test_apply_restart_failure(self):
+        app, paths = self.make_app()
+        db = engine.load_state(paths)
+        engine.add_credentials(db, "gemini", ["GK1-FAKE"])
+        engine.set_models(db, "gemini", ["gemini-3.7-flash"])
+        engine.save_state(db, paths)
+        app.db = engine.load_state(paths)
+        with mock.patch.object(engine, "restart_gateway", return_value=False):
+            async with app.run_test(size=(100, 50)) as pilot:
+                await pilot.pause()
+                app.push_screen(DoneScreen())
+                await pilot.pause()
+                screen = app.screen
+                assert isinstance(screen, DoneScreen)
+                await pilot.click("#apply")
+                await _wait_until(lambda: "not ready" in screen.last_status)
+                self.assertFalse(screen.applied_ok)
 
 
 if __name__ == "__main__":
