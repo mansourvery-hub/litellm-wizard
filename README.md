@@ -1,5 +1,11 @@
 # Local LLM Gateway (LiteLLM + setup wizard)
 
+> **Moved:** active development continues at
+> [`mansourvery-hub/llm-proxy-wizard`](https://github.com/mansourvery-hub/llm-proxy-wizard) —
+> a hard fork renamed for planned multi-proxy support (LiteLLM is just the first
+> backend). This repo is kept for history; new work (table-first TUI, OpenCode view)
+> lands there.
+
 Run many AI providers (Google Gemini, OpenRouter, Z.AI, TokenRouter, Ollama…)
 through **one address on your own machine**: `http://localhost:4000`.
 Any tool that speaks the OpenAI format (OpenCode, Cline, plain scripts) can use it —
